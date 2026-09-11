@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Newton</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700;800&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  :root{
+    --app:#fff; --rail:#f7f8fb; --s2:#f1f3f8; --s3:#e9ecf3;
+    --ink:#12151f; --ink2:#444b5d; --ink3:#79808f;
+    --line:#e4e7ef; --line2:#eef0f5;
+    --accent:#4f5bd5; --accent2:#6d78e6; --accentsoft:#ecedff;
+    --done:#1f9d55; --donesoft:#e6f5ec; --active:#b26a10; --activesoft:#fbeed6;
+    --pending:#a2aab9; --add:#1a7f45; --addsoft:#e4f4ea; --del:#b23a3a; --delsoft:#f8e7e7;
+    --spa:#6366f1; --spb:#8b5cf6; --spc:#ec4899;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{font-family:"IBM Plex Sans",system-ui,sans-serif;color:var(--ink);background:var(--app);
+    -webkit-font-smoothing:antialiased;display:flex;flex-direction:column;height:100vh;overflow:hidden}
+  .mono{font-family:"IBM Plex Mono",monospace}
+  h1,h2,h3{font-family:"Archivo",sans-serif;margin:0}
+
+  /* top bar */
+  .top{display:flex;align-items:center;gap:14px;padding:0 16px;height:52px;border-bottom:1px solid var(--line);flex:none}
+  .brand{display:flex;align-items:center;gap:9px;font-family:"Archivo";font-weight:800;font-size:16px}
+  .modes{display:flex;gap:2px;background:var(--s2);padding:3px;border-radius:9px}
+  .modes button{font:600 13px "IBM Plex Sans";color:var(--ink3);border:0;background:transparent;padding:6px 14px;border-radius:7px;cursor:pointer}
+  .modes button.on{background:var(--app);color:var(--accent);box-shadow:0 1px 2px rgba(0,0,0,.06)}
+  .top .sp{flex:1}
+  .chip{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--ink2);background:var(--s2);border:1px solid var(--line);padding:5px 11px;border-radius:8px}
+  .live{width:8px;height:8px;border-radius:50%;background:var(--done);box-shadow:0 0 0 3px var(--donesoft)}
+  select,input{font-family:inherit}
+
+  /* body */
+  .body{display:grid;grid-template-columns:230px 1fr 360px;flex:1;min-height:0}
+  .col{min-height:0;display:flex;flex-direction:column;overflow:hidden}
+  .sidebar{background:var(--rail);border-right:1px solid var(--line)}
+  .inspector{background:var(--rail);border-left:1px solid var(--line)}
+
+  .navlabel{font:600 10.5px "IBM Plex Mono";letter-spacing:.13em;text-transform:uppercase;color:var(--ink3);padding:14px 18px 6px}
+  .navitem{margin:1px 10px;padding:8px 11px;border-radius:9px;font-size:13px;color:var(--ink2);display:flex;align-items:center;gap:10px;cursor:pointer}
+  .navitem:hover{background:var(--s2)}
+  .navitem.on{background:var(--accentsoft);color:var(--accent);font-weight:600}
+  .navitem .count{margin-left:auto;font-size:11px;color:var(--ink3);background:var(--s3);padding:1px 7px;border-radius:10px}
+  .sidefoot{margin-top:auto;padding:12px 16px;border-top:1px solid var(--line);font-size:11.5px;color:var(--ink3);display:flex;align-items:center;gap:8px}
+
+  /* thread */
+  .thread{background:var(--app)}
+  .thead{padding:13px 22px;border-bottom:1px solid var(--line2);display:flex;align-items:center;gap:10px;flex:none}
+  .thead h2{font-weight:700;font-size:15px}
+  .badge{font:600 10.5px "IBM Plex Mono";letter-spacing:.05em;text-transform:uppercase;padding:3px 9px;border-radius:6px;color:var(--accent);background:var(--accentsoft)}
+  .stream{padding:20px 22px;overflow-y:auto;flex:1;display:flex;flex-direction:column;gap:14px}
+
+  .stages{display:flex;align-items:center;flex-wrap:wrap;gap:2px;margin-bottom:6px}
+  .stg{display:flex;align-items:center;gap:6px}
+  .stg .node{width:19px;height:19px;border-radius:50%;display:grid;place-items:center;font:700 10px "IBM Plex Sans";flex:none;background:var(--s3);color:var(--pending)}
+  .stg.done .node{background:var(--done);color:#fff}
+  .stg.active .node{background:var(--active);color:#fff;box-shadow:0 0 0 4px var(--activesoft)}
+  .stg .lbl{font-size:11.5px;color:var(--ink3)}
+  .stg.done .lbl{color:var(--ink2)} .stg.active .lbl{color:var(--active);font-weight:700}
+  .stg .bar{width:16px;height:2px;background:var(--line);margin:0 4px}
+  .stg.done .bar{background:var(--done)}
+
+  .msgU{align-self:flex-end;max-width:82%;background:var(--accent);color:#fff;padding:10px 14px;border-radius:13px 13px 4px 13px;font-size:13.5px;line-height:1.5}
+  .row{display:flex;gap:9px;font-size:13.5px;line-height:1.5;align-items:baseline}
+  .row .k{flex:none;width:70px;font:500 10.5px "IBM Plex Mono";text-transform:uppercase;letter-spacing:.04em;color:var(--ink3)}
+  .row.note{color:var(--done)} .row.verify{color:var(--accent)} .row.halt{color:var(--del)}
+  .row .t{flex:1}
+  .card{border:1px solid var(--line);border-radius:11px;overflow:hidden;margin:2px 0}
+  .plan{background:var(--s2);border:1px solid var(--line);border-radius:10px;padding:11px 14px}
+  .plan .pt{font:600 10px "IBM Plex Mono";letter-spacing:.1em;text-transform:uppercase;color:var(--ink3);margin-bottom:7px}
+  .plan ol{margin:0;padding-left:20px;font-size:13px;line-height:1.7}
+  .gate{border:1px solid var(--active);border-radius:11px;overflow:hidden}
+  .gate .gh{background:var(--activesoft);padding:9px 13px;font-size:12.5px;color:var(--active);font-weight:600;display:flex;align-items:center;gap:8px}
+  .gate .gh .mono{color:var(--ink)}
+  .diff{font:12px/1.6 "IBM Plex Mono";background:var(--app);padding:8px 0;max-height:230px;overflow:auto}
+  .diff div{padding:0 14px;white-space:pre-wrap;word-break:break-word}
+  .diff .a{background:var(--addsoft);color:var(--add)} .diff .d{background:var(--delsoft);color:var(--del)}
+  .acts{display:flex;gap:8px;padding:10px 13px;border-top:1px solid var(--line2);background:var(--rail)}
+  .acts button{font:600 12.5px "IBM Plex Sans";border-radius:8px;padding:7px 15px;cursor:pointer;border:1px solid var(--line);background:var(--app);color:var(--ink2)}
+  .acts .ok{background:var(--done);border-color:var(--done);color:#fff}
+  .acts .no{color:var(--del);border-color:var(--del)}
+  .final{padding:12px 15px;border-radius:11px;font-size:13.5px;line-height:1.55}
+  .final.ok{background:var(--donesoft);border:1px solid var(--done);color:#14602f}
+  .final.bad{background:var(--delsoft);border:1px solid var(--del);color:#7a1f1f}
+
+  /* composer */
+  .composer{padding:12px 18px;border-top:1px solid var(--line2);flex:none}
+  .cfields{display:flex;gap:8px;margin-bottom:8px}
+  .cfields input,.cfields select{border:1px solid var(--line);background:var(--s2);border-radius:8px;padding:7px 10px;font-size:12.5px;color:var(--ink)}
+  .cfields .proj{flex:1}
+  .cbox{display:flex;align-items:center;gap:10px;border:1px solid var(--line);background:var(--s2);border-radius:12px;padding:8px 10px}
+  .cbox input{flex:1;border:0;background:transparent;font-size:14px;color:var(--ink);outline:none}
+  .cbox .send{border:0;background:var(--accent);color:#fff;width:32px;height:32px;border-radius:8px;cursor:pointer;font-size:15px}
+  .cbox .send:disabled{opacity:.45;cursor:default}
+  .hint{font-size:11px;color:var(--ink3);margin-top:6px;padding-left:3px}
+  label.auto{display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--ink3)}
+
+  /* inspector */
+  .ih{padding:15px 18px 12px;border-bottom:1px solid var(--line2);flex:none}
+  .ih .t{font-family:"Archivo";font-weight:700;font-size:14px;display:flex;align-items:center;gap:8px}
+  .ih .s{font-size:12px;color:var(--ink3);margin-top:3px}
+  .ih .now{font:600 12px "IBM Plex Mono";color:var(--active);background:var(--activesoft);padding:3px 9px;border-radius:6px;margin-top:10px;display:inline-block}
+  .meter{margin-top:12px}
+  .meter .mr{display:flex;justify-content:space-between;font-size:11.5px;color:var(--ink3);margin-bottom:5px}
+  .meter .mr b{font-family:"IBM Plex Mono";color:var(--ink)}
+  .track{height:7px;border-radius:5px;background:var(--s3);overflow:hidden}
+  .fill{height:100%;background:linear-gradient(90deg,var(--spa),var(--spb),var(--spc));border-radius:5px;transition:width .3s}
+  .blocks{padding:12px;overflow-y:auto;flex:1;display:flex;flex-direction:column;gap:8px}
+  .blk{border:1px solid var(--line);border-radius:10px;padding:9px 11px;background:var(--app)}
+  .blk.pin{border-color:var(--accent);background:var(--accentsoft)}
+  .blk.drop{opacity:.5;border-style:dashed}
+  .blk .bt{display:flex;align-items:center;gap:8px}
+  .kind{font:600 10px "IBM Plex Mono";letter-spacing:.05em;text-transform:uppercase;padding:2px 6px;border-radius:5px}
+  .k-project{color:#2563a8;background:#e6eff9}.k-code{color:var(--accent);background:var(--accentsoft)}
+  .k-state{color:#7a3fb0;background:#f0e7f9}.k-plan{color:var(--active);background:var(--activesoft)}
+  .k-system{color:var(--ink3);background:var(--s3)}.k-goal{color:var(--ink3);background:var(--s3)}
+  .k-wiki{color:#7a3fb0;background:#f0e7f9}.k-memory{color:#8a5a12;background:#f7edd9}
+  .blk .lab{font-size:12px;color:var(--ink2)}
+  .blk .tok{margin-left:auto;font:11px "IBM Plex Mono";color:var(--ink3)}
+  .ifoot{padding:10px 16px;border-top:1px solid var(--line2);font-size:11px;color:var(--ink3);line-height:1.5;flex:none}
+  .empty{color:var(--ink3);font-size:13px;text-align:center;margin-top:30px}
+
+  /* project backlog */
+  .backlog{border:1px solid var(--line);border-radius:12px;overflow:hidden;margin:2px 0;box-shadow:0 1px 2px rgba(18,21,31,.05)}
+  .backlog .bh{background:var(--s2);padding:10px 14px;font:700 12.5px "Archivo";display:flex;align-items:center;gap:8px;color:var(--ink)}
+  .tk{display:flex;align-items:center;gap:10px;padding:9px 14px;border-top:1px solid var(--line2);font-size:13px}
+  .tk .id{font:600 11px "IBM Plex Mono";color:var(--ink3);flex:none}
+  .tk .tt{flex:1;color:var(--ink)}
+  .tk .file{font:11px "IBM Plex Mono";color:var(--ink3);flex:none}
+  .pill{font:600 10px "IBM Plex Mono";letter-spacing:.04em;text-transform:uppercase;padding:2px 9px;border-radius:20px;border:1px solid;flex:none}
+  .p-pending{color:var(--ink3);border-color:var(--line);background:var(--s2)}
+  .p-running{color:var(--active);border-color:var(--active);background:var(--activesoft)}
+  .p-done{color:var(--done);border-color:var(--done);background:var(--donesoft)}
+  .p-failed,.p-blocked{color:var(--del);border-color:var(--del);background:var(--delsoft)}
+  .taskhead{font:700 13.5px "Archivo";color:var(--accent);padding:8px 0 2px;border-top:1px dashed var(--line);margin-top:6px}
+</style>
+</head>
+<body>
+  <div class="top">
+    <div class="brand">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M12 3 L21 19 H3 Z" fill="#eceeff" stroke="#4f5bd5" stroke-width="1.6"/><path d="M12 3 L12 19" stroke="#8b5cf6" stroke-width="1.2"/></svg>
+      Newton
+    </div>
+    <div class="modes"><button>Chat</button><button class="on">Code</button><button>Cowork</button></div>
+    <div class="sp"></div>
+    <span class="chip"><span class="live"></span> <select id="model" class="mono" style="border:0;background:transparent;color:var(--ink);font-size:12px"></select></span>
+  </div>
+
+  <div class="body">
+    <div class="col sidebar">
+      <div class="navlabel">Workspace</div>
+      <div class="navitem on"><span>⌘</span> Code session</div>
+      <div class="navitem"><span>💬</span> Chat</div>
+      <div class="navitem"><span>◧</span> Cowork</div>
+      <div class="navlabel">Knowledge</div>
+      <div class="navitem"><span>◆</span> Memory <span class="count" id="memcount">0</span></div>
+      <div class="navitem"><span>▤</span> Markdown <span class="count">NEWTON.md</span></div>
+      <div class="navitem"><span>⬡</span> Components <span class="count">2/6</span></div>
+      <div class="sidefoot"><span class="live"></span> <span id="status">Ollama · ready</span></div>
+    </div>
+
+    <div class="col thread">
+      <div class="thead"><h2>Code session</h2><span class="badge">Conductor</span></div>
+      <div class="stream" id="stream">
+        <div class="empty" id="empty">Give Newton a coding task below. It will stage the work,<br>show its context window at each step, and ask before writing.</div>
+      </div>
+      <div class="composer">
+        <div class="cfields">
+          <input class="proj mono" id="project" value="." placeholder="project path" />
+          <label class="auto"><input type="checkbox" id="auto"/> auto-approve</label>
+        </div>
+        <div class="cbox">
+          <input id="task" placeholder="Describe a coding task…  e.g. Add a --json flag to scripts/wordcount.py" />
+          <button class="send" id="send">↑</button>
+        </div>
+        <div class="hint">Newton stages the work and asks before every write · fully local</div>
+      </div>
+    </div>
+
+    <div class="col inspector">
+      <div class="ih">
+        <div class="t">🔎 Context Inspector</div>
+        <div class="s">What's in the model's window — this stage.</div>
+        <div class="now" id="istage">idle</div>
+        <div class="meter"><div class="mr"><span>Window budget</span><span><b id="iused">0</b> / <b id="ibudget">6000</b> tok</span></div>
+          <div class="track"><div class="fill" id="ifill" style="width:0%"></div></div></div>
+      </div>
+      <div class="blocks" id="blocks"></div>
+      <div class="ifoot">Newton assembles this per stage — pinned blocks carry across stages; over-budget sources are dropped. This is the control a small local model needs to stay on task.</div>
+    </div>
+  </div>
+
+<script>
+const STAGES=["Understand","Retrieve","Plan","Edit","Verify","Remember"];
+let runId=null, es=null, mode='task', projectShown=false;
+const $=id=>document.getElementById(id);
+const stream=$('stream');
+
+// Top-bar modes: Code = single task, Cowork = build a whole project.
+const modeBtns=[...document.querySelectorAll('.modes button')];
+modeBtns.forEach(b=>b.onclick=()=>{
+  modeBtns.forEach(x=>x.classList.remove('on'));b.classList.add('on');
+  mode = b.textContent.trim()==='Cowork' ? 'project' : 'task';
+  $('task').placeholder = mode==='project'
+    ? 'Describe a project to build…  e.g. Build a tiny calculator: calc.py plus a main.py that uses it'
+    : 'Describe a coding task…  e.g. Add a --json flag to scripts/wordcount.py';
+});
+
+async function loadModels(){
+  try{const r=await fetch('/api/models');const d=await r.json();
+    const sel=$('model');sel.innerHTML='';
+    (d.models.length?d.models:['(no models)']).forEach(m=>{const o=document.createElement('option');o.value=m;o.textContent=m;sel.appendChild(o);});
+    const pref=d.models.find(m=>m.includes('qwen'));if(pref)sel.value=pref;
+  }catch(e){$('status').textContent='Ollama unreachable';}
+}
+loadModels();
+
+function el(cls,html){const d=document.createElement('div');d.className=cls;if(html!=null)d.innerHTML=html;stream.appendChild(d);stream.scrollTop=stream.scrollHeight;return d;}
+function esc(s){return (s??'').toString().replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+
+let stepper=null;
+function ensureStepper(){
+  if(stepper)return stepper;
+  stepper=el('stages');
+  stepper.innerHTML=STAGES.map((s,i)=>
+    `<div class="stg" data-s="${s}"><span class="node">${i+1}</span><span class="lbl">${s}</span></div>`+
+    (i<STAGES.length-1?'<span class="stg"><span class="bar"></span></span>':'')).join('');
+  return stepper;
+}
+function markStage(name){
+  const base=name.split('·')[0].trim();
+  if(STAGES.includes(base)){
+    ensureStepper();
+    let hit=false;
+    STAGES.forEach(s=>{const n=stepper.querySelector(`[data-s="${s}"]`);n.classList.remove('active');
+      if(s===base){n.classList.add('active');n.querySelector('.node').textContent='◉';hit=true;}
+      else if(!hit){n.classList.add('done');n.querySelector('.node').textContent='✓';}
+    });
+  }
+  el('row','<span class="k">stage</span><div class="t" style="font-family:Archivo;font-weight:700;color:#b26a10">◆ '+esc(name)+'</div>');
+}
+
+// --- project mode: backlog + per-task status ---
+let taskPills={};
+function renderBacklog(tasks){
+  taskPills={};
+  const c=el('backlog');
+  c.innerHTML='<div class="bh">▤ Backlog · '+tasks.length+' tasks</div>'+
+    tasks.map(t=>`<div class="tk" data-t="${esc(t.id)}"><span class="id">${esc(t.id)}</span><span class="tt">${esc(t.title)}</span><span class="file">${esc(t.file||'—')}</span><span class="pill p-pending">pending</span></div>`).join('');
+  tasks.forEach(t=>taskPills[t.id]=c.querySelector(`[data-t="${CSS.escape(t.id)}"] .pill`));
+}
+function updateTask(p){
+  const pill=taskPills[p.id];
+  if(p.status==='start'){
+    if(pill){pill.className='pill p-running';pill.textContent='running';}
+    stepper=null;                                   // fresh stage stepper per task
+    el('taskhead','▸ ['+esc(p.id)+'] '+esc(p.title));
+  }else if(pill){
+    const ok=p.status==='done';
+    pill.className='pill p-'+(ok?'done':'failed');pill.textContent=p.status;
+  }
+}
+
+function renderContext(p){
+  $('istage').textContent='◉ '+p.stage;
+  $('iused').textContent=p.used;$('ibudget').textContent=p.budget;
+  $('ifill').style.width=Math.min(100,100*p.used/Math.max(1,p.budget))+'%';
+  const b=$('blocks');b.innerHTML='';
+  (p.blocks||[]).forEach(([kind,label,tok,pinned])=>{
+    const d=document.createElement('div');d.className='blk'+(pinned?' pin':'');
+    d.innerHTML=`<div class="bt"><span class="kind k-${kind}">${kind}</span><span class="lab">${esc(label)}</span><span class="tok">${tok}t</span></div>`;
+    b.appendChild(d);
+  });
+  (p.dropped||[]).forEach(([kind,label,tok])=>{
+    const d=document.createElement('div');d.className='blk drop';
+    d.innerHTML=`<div class="bt"><span class="kind k-${kind}">${kind}</span><span class="lab">${esc(label)} — dropped</span><span class="tok">${tok}t</span></div>`;
+    b.appendChild(d);
+  });
+}
+
+function showGate(p){
+  if(p.auto){el('row note','<span class="k">gate</span><div class="t">auto-approved '+esc(p.kind)+'</div>');return;}
+  const g=el('gate');
+  g.innerHTML=`<div class="gh">⏸ Approve ${esc(p.kind)}? <span class="mono">${esc(p.args.path||'')}</span><span style="margin-left:auto;font:11px 'IBM Plex Mono';color:var(--ink3)">Enter = approve · Esc = reject</span></div>
+    <div class="acts"><button class="ok">✓ Approve</button><button class="no">Reject</button></div>`;
+  const ok=g.querySelector('.ok'), no=g.querySelector('.no');
+  const done=(d,label,color)=>{decide(d);g.querySelector('.acts').innerHTML=`<span style="font-size:12px;color:${color}">${label}</span>`;window._gate=null;};
+  ok.onclick=()=>done(true,'approved','#1f9d55');
+  no.onclick=()=>done(false,'rejected','#b23a3a');
+  window._gate={ok:()=>ok.onclick(),no:()=>no.onclick()};
+  g.scrollIntoView({behavior:'smooth',block:'center'});  // bring it into view
+  setTimeout(()=>ok.focus(),50);                          // focus so Enter/Space activates it
+}
+// A pending gate takes the keyboard: Enter approves, Esc rejects, from anywhere.
+document.addEventListener('keydown',e=>{
+  if(!window._gate)return;
+  if(e.key==='Enter'){e.preventDefault();e.stopPropagation();window._gate.ok();}
+  else if(e.key==='Escape'){e.preventDefault();window._gate.no();}
+},true);
+async function decide(d){await fetch('/api/approve/'+runId,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({decision:d})});}
+
+function dispatch(ch,p){
+  if(ch==='stage')markStage(p);
+  else if(ch==='context')renderContext(p);
+  else if(ch==='note')el('row note','<span class="k">·</span><div class="t">'+esc(p)+'</div>');
+  else if(ch==='plan'){const c=el('plan');c.innerHTML='<div class="pt">proposed plan</div><ol>'+p.map(s=>'<li>'+esc(s)+'</li>').join('')+'</ol>';}
+  else if(ch==='diff'){
+    const lines=(s,cls)=>esc(s).split('\n').map(l=>`<div class="${cls}">${cls==='a'?'+ ':'- '}${l}</div>`).join('');
+    const c=el('card');c.innerHTML=`<div class="gh" style="background:var(--activesoft);padding:8px 13px;font:600 12px 'IBM Plex Sans';color:#b26a10">✎ ${esc(p.file)}</div><div class="diff">${lines(p.old,'d')}${lines(p.new,'a')}</div>`;
+  }
+  else if(ch==='verify')el('row verify','<span class="k">gate</span><div class="t">⚖ '+esc(p)+'</div>');
+  else if(ch==='gate')showGate(p);
+  else if(ch==='halt')el('row halt','<span class="k">halt</span><div class="t">✕ '+esc(p)+'</div>');
+  else if(ch==='backlog')renderBacklog(p);
+  else if(ch==='task')updateTask(p);
+  else if(ch==='project'){projectShown=true;el('final '+(p.ok?'ok':'bad'),'█ '+esc(p.answer));}
+  else if(ch==='done'){
+    if(!projectShown)el('final '+(p.ok?'ok':'bad'),(p.ok?'✓ ':'✕ ')+esc(p.answer).replace(/\n/g,'<br>'));
+    $('send').disabled=false;$('istage').textContent='done';if(es)es.close();
+  }
+}
+
+async function run(){
+  const task=$('task').value.trim();if(!task)return;
+  $('empty')?.remove();stepper=null;projectShown=false;
+  $('send').disabled=true;
+  el('msgU',esc(task));$('task').value='';
+  const r=await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({task,project:$('project').value||'.',model:$('model').value,auto:$('auto').checked,mode})});
+  runId=(await r.json()).run_id;
+  es=new EventSource('/api/events/'+runId);
+  es.onmessage=e=>{const d=JSON.parse(e.data);dispatch(d.ch,d.payload);};
+  es.onerror=()=>{$('send').disabled=false;};
+}
+$('send').onclick=run;
+$('task').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();run();}});
+</script>
+</body>
+</html>

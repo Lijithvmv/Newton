@@ -1,0 +1,666 @@
+"""LoopEngine — the durable Plan → Execute → Verify → Replan loop.
+
+Decompose the goal into atomic steps, then for each ready step: shape exactly the right context,
+run the atomic executor, verify, and (on failure) retry with the error fed back — up to a cap. State
+is checkpointed after EVERY step, so a run that takes hours can be killed and resumed from where it
+stopped, never repeating finished work. This is the engine that turns a small model's reliable
+atomic steps into a finished compound result — the thing a naive prompt and a raw autonomous loop
+both fail at.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+import threading
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from ..conductor.verify import python_parses
+from ..config import Settings
+from ..context import project_tree
+from ..index.graph import _module_of
+from ..tools import ToolBelt
+from .decompose import decompose
+from .execute import NativeStepExecutor, StepExecutor, StepResult
+from .state import BLOCKED, DONE, FAILED, PENDING, RUN, RUNNING, WRITE, LoopState, Step
+
+MAX_ATTEMPTS = 3
+# How many times a failing check (RUN step) may drive a code fix + re-check. Bounded so a genuinely
+# unsolvable task can't loop forever; free local compute makes each extra cycle cheap.
+REPAIR_CYCLES = 2
+# How many times the loop may RE-DECOMPOSE when the plan itself is wrong (a step failed/blocked that
+# fixing a single file can't resolve) — the "Replan" of Plan→Execute→Verify→Replan.
+REPLAN_CYCLES = 2
+
+# Third-party packages a generated file may import that aren't installed in Newton's venv — a
+# missing one is an environment gap (deferred to a real run), NOT a code bug to retry on. A missing
+# LOCAL/hallucinated module (e.g. `project.pricing` when the real one is `store.pricing`) is a bug.
+_EXTERNAL_DEPS = {
+    "fastapi", "starlette", "uvicorn", "sqlalchemy", "pydantic", "httpx", "pytest",
+    "jinja2", "aiofiles", "passlib", "jose", "bcrypt", "alembic", "flask", "django", "numpy",
+    "pandas", "requests", "aiohttp", "redis", "click", "rich", "typer", "yaml", "dotenv",
+}
+
+
+@dataclass
+class LoopResult:
+    ok: bool
+    answer: str
+    state: LoopState | None = None
+
+
+class ContextShaper:
+    """The context-engineering core: assemble exactly what THIS step needs into a small budget.
+
+    Parts are tagged PRIORITY (the goal, the target file's current content, the prior error — kept
+    verbatim) or REFERENCE (what upstream steps built, retrieved code — compactible). When the
+    assembled window overflows the budget, reference context is SUMMARISED (compaction) rather than
+    blindly clipped, so a long, many-step loop keeps the essential facts instead of losing the tail.
+    """
+
+    def __init__(self, root: Path, *, budget_chars: int = 6000, per_file: int = 1800,
+                 summarize: Callable[[str, int], str] | None = None) -> None:
+        self.root = Path(root)
+        self.budget_chars = budget_chars
+        self.per_file = per_file
+        self.summarize = summarize          # (text, max_chars) -> compacted text; None = clip
+
+    def _read(self, rel: str) -> str:
+        p = self.root / rel
+        try:
+            return p.read_text(encoding="utf-8", errors="ignore")[: self.per_file] if p.is_file() else ""
+        except OSError:
+            return ""
+
+    def parts(self, state: LoopState, step: Step, *, error: str | None = None) -> list[tuple[bool, str]]:
+        """Return (is_priority, text) parts. Priority parts are never compacted."""
+        out: list[tuple[bool, str]] = [(True, f"Overall goal: {state.goal}")]
+        for dep in state.upstream_outputs(step):
+            if dep.file:
+                content = self._read(dep.file)
+                if content:
+                    out.append((False, f"Already built `{dep.file}`:\n```\n{content}\n```"))
+        if step.file:
+            current = self._read(step.file)
+            if current:
+                out.append((True, f"Current `{step.file}` (edit it):\n```\n{current}\n```"))
+        if error:
+            out.append((True, f"Your previous attempt failed: {error}\nFix that specifically."))
+        return out
+
+    def shape(self, state: LoopState, step: Step, *, error: str | None = None) -> str:
+        tagged = self.parts(state, step, error=error)
+        head = "\n\n".join(t for p, t in tagged if p)
+        ref = "\n\n".join(t for p, t in tagged if not p)
+        if not ref:
+            return head[: self.budget_chars]
+        if len(head) + len(ref) + 2 <= self.budget_chars:
+            return f"{head}\n\n{ref}"
+        room = max(self.budget_chars - len(head) - 4, 600)      # leave the priority head intact
+        return f"{head}\n\n{self._compact(ref, room)}"[: self.budget_chars]
+
+    def _compact(self, text: str, room: int) -> str:
+        """Fit reference context into `room` chars — SUMMARISE it if a summarizer is wired, else
+        fall back to a clip. Never fails: a bad or missing summary just clips."""
+        if len(text) <= room:
+            return text
+        if self.summarize is not None:
+            try:
+                s = self.summarize(text, room)
+                if s and s.strip():
+                    return s.strip()[: room]
+            except Exception:
+                pass
+        return text[: room]
+
+
+class RetrievalShaper(ContextShaper):
+    """The context-engine for LARGE repos: beyond upstream deps + target, RETRIEVE the most relevant
+    existing files for the step (RepoIndex — BM25 + semantic + PageRank centrality), so the small
+    window holds the right context even when the repo far exceeds it. This is what lets the loop
+    find a symbol defined in a file the planner never named."""
+
+    def __init__(self, root: Path, *, budget_chars: int = 8000, per_file: int = 1400, k: int = 4,
+                 summarize: Callable[[str, int], str] | None = None) -> None:
+        super().__init__(root, budget_chars=budget_chars, per_file=per_file, summarize=summarize)
+        self.k = k
+        self._index = None
+
+    def _idx(self):
+        if self._index is None:
+            from ..index import RepoIndex
+            from ..index.embeddings import Embedder
+            self._index = RepoIndex(self.root, embedder=Embedder()).build()
+        return self._index
+
+    def _importable_symbols(self, rel: str) -> list[str]:
+        """Public top-level names a file exports — functions, classes, AND module constants — so we
+        can hand the model exact, copy-paste import lines instead of hoping it infers them."""
+        import ast
+        try:
+            tree = ast.parse((self.root / rel).read_text(encoding="utf-8", errors="ignore"))
+        except (OSError, SyntaxError):
+            return []
+        names: list[str] = []
+        for n in tree.body:
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if not n.name.startswith("_"):
+                    names.append(n.name)
+            elif isinstance(n, ast.Assign):
+                for t in n.targets:
+                    if isinstance(t, ast.Name) and not t.id.startswith("_"):
+                        names.append(t.id)
+        return list(dict.fromkeys(names))
+
+    def _import_menu(self, paths: list[str]) -> str:
+        lines = []
+        for rel in paths:
+            if rel.endswith(".py"):
+                syms = self._importable_symbols(rel)
+                if syms:
+                    lines.append(f"  from {_module_of(rel)} import {', '.join(syms)}")
+        if not lines:
+            return ""
+        return ("Available imports in THIS project — use these EXACT module paths and names, and do "
+                "NOT invent module names or symbols:\n" + "\n".join(lines))
+
+    def parts(self, state: LoopState, step: Step, *, error: str | None = None) -> list[tuple[bool, str]]:
+        base = super().parts(state, step, error=error)          # tagged (is_priority, text)
+        seen = {step.file} | {d.file for d in state.upstream_outputs(step) if d.file}
+        retrieved: list[tuple[bool, str]] = []
+        hit_paths: list[str] = []
+        try:
+            idx = self._idx()
+            focus = [step.file] if step.file else None
+            for chunk, _ in idx.search(f"{state.goal} {step.goal} {step.file}", k=self.k, focus=focus):
+                if chunk.path in seen:
+                    continue
+                seen.add(chunk.path)
+                hit_paths.append(chunk.path)
+                # Hand the model the IMPORT-READY module name AND everything the module defines — so a
+                # constant retrieved from one chunk doesn't hide the function defined in another chunk
+                # of the same file (small models otherwise hallucinate a module for the missing symbol).
+                if chunk.path.endswith(".py"):
+                    fi = idx.graph.files.get(chunk.path)
+                    defs = ", ".join(fi.defs) if fi and fi.defs else ""
+                    head = f"Relevant existing code — import it as module `{_module_of(chunk.path)}` (file {chunk.path}"
+                    head += f"; this module also defines: {defs})" if defs else ")"
+                    head += ":"
+                else:
+                    head = f"Relevant `{chunk.ref}` (existing code):"
+                # Retrieved code is REFERENCE context (compactible when the window overflows).
+                retrieved.append((False, f"{head}\n```\n{chunk.text[: self.per_file]}\n```"))
+        except Exception:
+            pass
+        # An explicit import menu (PRIORITY — never compacted): exact import lines from the retrieved
+        # files + the files this step depends on. Small models follow this menu instead of inventing
+        # module names from the goal's prose (`from pricing import DISCOUNT_RATE`).
+        menu_paths = hit_paths + [d.file for d in state.upstream_outputs(step) if d.file]
+        menu = self._import_menu(menu_paths)
+        head_extra = [(True, menu)] if menu else []
+        return base[:1] + head_extra + retrieved + base[1:]
+
+
+class LoopEngine:
+    def __init__(self, settings: Settings, *, executor: StepExecutor | None = None,
+                 shaper: ContextShaper | None = None,
+                 emit: Callable[[str, Any], None] | None = None,
+                 checkpoint: str = "loop.json") -> None:
+        self.s = settings
+        self.root = Path(settings.project_root)
+        self.emit = emit or (lambda *a: None)
+        self.executor = executor or NativeStepExecutor(self.root, settings.agent_model)
+        # Retrieval is the product-correct default: the context-engine always pulls the relevant
+        # existing files into each step's window (essential on large repos; harmless on small ones),
+        # with compaction wired so a long, many-step run stays inside the window.
+        self.shaper = shaper or RetrievalShaper(self.root, summarize=self._make_summarizer())
+        self.checkpoint_path = self.root / ".newton" / checkpoint
+        self._pending_error: dict[str, str] = {}      # step id → error to inject into its next context
+        self._extra_temp: dict[str, float] = {}       # step id → added temperature (rises each repair)
+        # Parallel step execution: independent ready steps (distinct files, no dep path between them)
+        # run concurrently. Default 1 (sequential, unchanged). It's real work overlap — the model
+        # calls are blocking HTTP so threads release the GIL — but the actual speedup depends on the
+        # backend: a single Ollama instance with OLLAMA_NUM_PARALLEL=1 serialises generation, so the
+        # win comes from parallel slots (num_parallel>1 batches on the GPU) and from a step's pytest/
+        # subprocess overlapping another's generation. Opt in via NEWTON_LOOP_PARALLEL; measure per box.
+        self.parallel = max(1, int(os.environ.get("NEWTON_LOOP_PARALLEL", "1")))
+        self._state_lock = threading.Lock()           # guards checkpoint saves + status writes in a wave
+
+    def _make_summarizer(self) -> Callable[[str, int], str]:
+        """A model-backed compactor: squeeze reference context down to the facts a coding step needs
+        (module paths, signatures, constant values). Used only when the window overflows."""
+        model = self.s.agent_model
+
+        def summarize(text: str, room: int) -> str:
+            from ..llm import complete
+            resp = complete(model, [
+                {"role": "system", "content":
+                    "Compress the code/context below to only the facts needed to write ONE coding "
+                    "step: module import paths, function/class signatures, and constant names+values. "
+                    "Terse bullet list, no prose, no explanation."},
+                {"role": "user", "content": text[:16000]},
+            ], temperature=0)
+            return (resp.choices[0].message.content or "").strip()
+
+        return summarize
+
+    def run(self, goal: str, *, resume: bool = False) -> LoopResult:
+        state = self._load_or_plan(goal, resume)
+        if state is None:
+            return LoopResult(False, "could not decompose the goal into steps")
+
+        self._drive(state)
+        # Self-generated verification: if the plan built code but planned no check, write a
+        # goal-grounded test and run it — so a step's LOGIC is validated even when the model forgot
+        # to test. A failing generated test then feeds the normal repair.
+        self._ensure_verification(state, goal)
+        # Test-driven self-correction: if a check (a RUN step, e.g. the tests) failed, feed the
+        # failure back to fix the CODE it exercises and re-run the check. Free compute + unlimited
+        # time on local hardware make this iteration the way to lift a weak model's logic quality —
+        # it turns "tests failed, give up" into "tests failed, fix the code, try again".
+        for _ in range(REPAIR_CYCLES):
+            if not self._repair_from_test_failure(state):
+                break
+            self._drive(state)
+
+        # Replanning: if the loop is still stuck (a step failed/blocked that fixing one file didn't
+        # resolve), the PLAN itself was wrong — re-decompose the remaining work given what exists and
+        # what went wrong, and drive the new plan (+ its own repair cycles).
+        for gen in range(1, REPLAN_CYCLES + 1):
+            if state.all_done() or not self._replan(state, goal, gen):
+                break
+            self._drive(state)
+            for _ in range(REPAIR_CYCLES):
+                if not self._repair_from_test_failure(state):
+                    break
+                self._drive(state)
+
+        # Integration verification: per-file verify + the unit test can all pass while the ASSEMBLED
+        # app won't even load. As a final gate, import the entrypoint with its real deps and let a
+        # load failure feed the repair loop — closing the wiring gap the Scene Script Studio E2E
+        # (D63) exposed, where 14/14 steps were "done" but the app didn't run.
+        self._ensure_integration_check(state)
+
+        return self._finalize(state)
+
+    def _drive(self, state: LoopState) -> None:
+        """Run every ready step to completion, checkpointing after each. Independent ready steps run
+        in a wave of up to `self.parallel` at once; dependents wait for their upstreams as before."""
+        while not state.all_done() and state.remaining() > 0:
+            wave = state.ready_batch(self.parallel)
+            if not wave:
+                break
+            if len(wave) == 1:
+                self._run_step(wave[0], state)        # sequential path — identical to before
+            else:
+                self._run_wave(wave, state)
+
+    def _run_wave(self, wave: list[Step], state: LoopState) -> None:
+        """Execute an independent set of steps concurrently. Each still checkpoints when it finishes
+        (under a lock), so an interrupted wave resumes cleanly: done steps stay DONE, in-flight steps
+        are reset to PENDING on resume and simply redone."""
+        self.emit("note", f"Building {len(wave)} independent steps in parallel…")
+        with ThreadPoolExecutor(max_workers=len(wave)) as pool:
+            futures = [pool.submit(self._run_step, step, state) for step in wave]
+            for f in as_completed(futures):
+                f.result()                            # surface any worker exception
+
+    def _run_step(self, step: Step, state: LoopState) -> None:
+        """Drive ONE step to DONE/FAILED: best-of-N attempts, import repair, verify, checkpoint.
+        Thread-safe — the only shared mutations (log append, checkpoint save, the completion emit)
+        are taken under a lock, and each step owns a distinct file, so a wave can run this in parallel."""
+        step.status = RUNNING
+        self.emit("step", {"id": step.id, "goal": step.goal, "kind": step.kind,
+                           "file": step.file, "status": "start"})
+
+        error: str | None = self._pending_error.pop(step.id, None)
+        res = StepResult(False, "")
+        for attempt in range(MAX_ATTEMPTS):
+            step.attempts += 1
+            # Best-of-N: each attempt samples a genuinely different candidate (temperature rises)
+            # so the loop EXPLORES instead of repeating the same broken solution; the verify (and
+            # a later test) is the selector. Free local compute makes the extra tries cheap.
+            temperature = min(0.1 + 0.3 * attempt + self._extra_temp.get(step.id, 0.0), 0.9)
+            context = self.shaper.shape(state, step, error=error)
+            res = self.executor.execute(step, context, temperature=temperature)
+            if res.ok and step.kind != RUN and step.file.endswith(".py"):
+                # Deterministic safety net: fix intra-project imports the model got wrong before
+                # verifying — the system knows where every symbol lives, so imports resolve.
+                if self._repair_imports(step.file):
+                    self.emit("note", f"Repaired imports in {step.file}")
+            if res.ok:
+                v = self._verify(step)
+                if v.ok:
+                    break
+                res = StepResult(False, v.detail)
+            error = res.detail
+
+        step.status = DONE if res.ok else FAILED
+        step.result = res.detail[:200]
+        with self._state_lock:
+            state.log.append(f"{step.id} {step.status}: {step.result}")
+            state.save(self.checkpoint_path)          # checkpoint after EVERY step → resumable
+        self.emit("step", {"id": step.id, "status": step.status, "detail": step.result})
+
+    def _repair_from_test_failure(self, state: LoopState) -> bool:
+        """A failed RUN step (a check/tests) means the CODE is wrong, not the command — retrying the
+        command is useless. Find the code step whose file the error blames, reset it (and the check)
+        to pending with the failure as context, and let the loop re-do them. True if repair was set up."""
+        failed = next((s for s in state.steps if s.kind == RUN and s.status == FAILED), None)
+        if failed is None:
+            return False
+        # "No tests collected" isn't a code bug — the TEST file is malformed (no `def test_*`). Route
+        # the fix to the test file, not the code, or the loop blames the code and replans forever.
+        if "NO_TESTS_COLLECTED" in (failed.result or ""):
+            culprit = self._test_step(state)
+            if culprit is None:
+                return False
+            self.emit("note", f"The check collected no tests — rewriting {culprit.file} with real "
+                              f"`def test_*` functions and re-running it.")
+            self._pending_error[culprit.id] = (
+                "The test run collected NO tests. pytest only runs functions named `test_*` — the "
+                "file has bare module-level asserts instead. Rewrite it so every assertion lives "
+                "inside a `def test_...():` function, then it will run.")
+        else:
+            culprit = self._culprit_step(failed.result, state)
+            if culprit is None:
+                return False
+            self.emit("note", f"A check failed — fixing {culprit.file or culprit.id} and re-running it.")
+            self._pending_error[culprit.id] = (
+                f"A later check failed with this error — fix the code so it passes:\n{failed.result}")
+        culprit.status = PENDING
+        culprit.result = ""
+        # Each repair explores a MORE different fix (best-of-N over cycles), not the same broken one.
+        self._extra_temp[culprit.id] = self._extra_temp.get(culprit.id, 0.0) + 0.3
+        failed.status = PENDING
+        for s in state.steps:                          # unblock what the failure had blocked
+            if s.status == BLOCKED:
+                s.status = PENDING
+        state.save(self.checkpoint_path)
+        return True
+
+    def _test_step(self, state: LoopState) -> Step | None:
+        """The WRITE step for a test file (`test_*.py`) — what to fix when a check collected no tests."""
+        for s in state.steps:
+            if s.kind != RUN and s.file.endswith(".py") \
+                    and s.file.replace("\\", "/").rsplit("/", 1)[-1].startswith("test_"):
+                return s
+        return None
+
+    def _culprit_step(self, error: str, state: LoopState) -> Step | None:
+        """The code (WRITE .py) step whose file the error names — the file to fix. Prefers a
+        non-test code file (the bug is in the code, not usually the test)."""
+        code = {s.file.replace("\\", "/"): s for s in state.steps
+                if s.kind != RUN and s.file.endswith(".py")}
+        fallback = None
+        for m in re.finditer(r"([\w./\\-]+\.py)", error or ""):
+            tok = m.group(1).replace("\\", "/")
+            base = tok.rsplit("/", 1)[-1]
+            for path, step in code.items():
+                if path == tok or path.rsplit("/", 1)[-1] == base:
+                    if not base.startswith("test_"):
+                        return step
+                    fallback = fallback or step
+        return fallback
+
+    def _ensure_verification(self, state: LoopState, goal: str) -> None:
+        """If the plan produced code but NO check, generate a goal-grounded test and run it — so a
+        step's LOGIC is validated even when the model didn't plan a test. Conservative on purpose: a
+        model-authored test can be imperfect, so it's added ONLY when there's no real test, is
+        grounded in the goal's own examples, and a failing one feeds the normal repair. Off with
+        NEWTON_LOOP_SELFTEST=0."""
+        if os.getenv("NEWTON_LOOP_SELFTEST", "1") == "0":
+            return
+        if any(s.kind == RUN for s in state.steps):
+            return                                   # the model already planned a check — trust it
+        code = [s for s in state.steps if s.kind != RUN and s.file.endswith(".py")
+                and not s.file.rsplit("/", 1)[-1].startswith("test_") and s.status == DONE]
+        if not code:
+            return
+        self.emit("note", "No test in the plan — writing a check to verify the work.")
+        test_step = Step(
+            id="v_test", kind=WRITE, file="test_generated.py",
+            goal=(f"Write pytest tests that verify this goal is met: {goal}\n"
+                  "Import from the project's modules (see the available imports) and assert their "
+                  "behaviour matches the goal — use the EXACT examples the goal gives. Test only what "
+                  "the goal clearly specifies; do not invent requirements. Every assertion MUST live "
+                  "inside a `def test_...():` function — pytest runs functions named test_*, NOT bare "
+                  "module-level asserts."))
+        run_step = Step(id="v_run", kind=RUN, command='{py} -m pytest -q test_generated.py',
+                        goal="run the generated check", depends_on=["v_test"])
+        state.steps += [test_step, run_step]
+        state.save(self.checkpoint_path)
+        self.emit("plan", [{"id": s.id, "goal": s.goal, "kind": s.kind, "file": s.file,
+                            "depends_on": s.depends_on} for s in (test_step, run_step)])
+        self._drive(state)
+
+    def _ensure_integration_check(self, state: LoopState) -> None:
+        """Whole-app load check — the gap the per-file verify and the unit test both miss. Each file
+        can pass its own verify while the ASSEMBLED app won't even import (a cross-file import that
+        doesn't resolve, a module-load-time error like a StaticFiles dir that isn't there, a symbol
+        used but never imported). After the build, import the app's entrypoint in a subprocess with
+        its real dependencies installed; a failure that names a project file feeds the normal repair.
+
+        Deliberately a SMOKE check, and honest about it: it catches 'the app doesn't load', not pure
+        request-time logic bugs (those need a running server + client). Needs a requirements.txt so
+        deps can be made available — without one an import would fail on a third-party module, not a
+        real bug, so we skip rather than cry wolf. Off with NEWTON_LOOP_INTEGRATION=0."""
+        if os.getenv("NEWTON_LOOP_INTEGRATION", "1") == "0":
+            return
+        if any(s.id == "i_run" for s in state.steps):
+            return                                       # already added (e.g. on resume)
+        entry = self._detect_entrypoint(state)
+        if not entry:
+            return
+        py, ready = self._project_python()
+        if not ready:
+            self.emit("note", "Skipping the whole-app check — couldn't prepare its dependencies.")
+            return
+        self.emit("note", "Checking the whole app loads together…")
+        step = Step(id="i_run", kind=RUN, command=f'"{py}" -c "import {entry}"',
+                    goal=f"import {entry} — confirm the assembled app loads")
+        state.steps.append(step)
+        state.save(self.checkpoint_path)
+        self.emit("plan", [{"id": step.id, "goal": step.goal, "kind": step.kind,
+                            "file": step.file, "depends_on": step.depends_on}])
+        self._run_step(step, state)
+        for _ in range(REPAIR_CYCLES):                   # a load failure fixes the file it blames
+            if not self._repair_from_test_failure(state):
+                break
+            self._drive(state)
+
+    def _detect_entrypoint(self, state: LoopState) -> str | None:
+        """The module to import as the app's entrypoint — the file most likely to wire the app
+        together (main.py/app.py, a `__main__` guard, or a FastAPI/Flask app object). Returns its
+        dotted import path, or None when nothing looks like an entrypoint."""
+        best, best_score = None, 0
+        for s in state.steps:
+            if s.status != DONE or s.kind == RUN or not s.file.endswith(".py"):
+                continue
+            base = s.file.replace("\\", "/").rsplit("/", 1)[-1]
+            if base.startswith("test_"):
+                continue
+            try:
+                txt = (self.root / s.file).read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                txt = ""
+            score = (3 if base in ("main.py", "app.py") else 0)
+            score += 2 if "__main__" in txt else 0
+            score += 2 if ("FastAPI(" in txt or "Flask(" in txt) else 0
+            if score > best_score:
+                best, best_score = s, score
+        if best is None or best_score == 0:
+            return None
+        return _module_of(best.file.replace("\\", "/"))
+
+    def _project_python(self) -> tuple[str, bool]:
+        """(python to run the check, deps-ready). With a requirements.txt, build/reuse a project
+        .venv and install into it so third-party imports resolve — then a failed import is a REAL
+        bug, not a missing package. Without one, we can't guarantee deps, so report not-ready."""
+        req = self.root / "requirements.txt"
+        if not req.is_file():
+            return sys.executable, False
+        venv = self.root / ".venv"
+        py = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        try:
+            if not py.exists():
+                subprocess.run([sys.executable, "-m", "venv", str(venv)],
+                               capture_output=True, timeout=180, check=True)
+            subprocess.run([str(py), "-m", "pip", "install", "-q", "-r", str(req)],
+                           capture_output=True, timeout=600, check=True)
+        except (subprocess.SubprocessError, OSError):
+            return sys.executable, False
+        return str(py), True
+
+    @staticmethod
+    def _reid(steps: list[Step], prefix: str) -> list[Step]:
+        """Prefix a fresh plan's step ids (and internal deps) so they can't collide with steps
+        already recorded in the state."""
+        idmap = {s.id: f"{prefix}{s.id}" for s in steps}
+        for s in steps:
+            s.id = idmap[s.id]
+            s.depends_on = [idmap[d] for d in s.depends_on if d in idmap]
+        return steps
+
+    def _replan(self, state: LoopState, goal: str, gen: int) -> bool:
+        """Re-decompose the remaining work when the plan was wrong. Keeps the steps that DID finish,
+        replaces the failed/blocked/unrun ones with a fresh plan that accounts for what exists and
+        what went wrong. Returns True if a new plan was produced. Never fails the run — best-effort."""
+        stuck = [s for s in state.steps if s.status in (FAILED, BLOCKED)]
+        if not stuck:
+            return False
+        why = "; ".join(f"{s.file or s.id}: {s.result}"[:120] for s in stuck)[:400]
+        self.emit("stage", "Replan")
+        self.emit("note", "The plan didn't work — re-planning the remaining work.")
+        augmented = (
+            f"{goal}\n\nSome files may already exist in the project. The previous attempt got stuck: "
+            f"{why}. Plan the steps needed to FINISH and FIX this — prefer EDITING existing files "
+            f"over recreating them, and end with a step that runs the tests.")
+        try:
+            new_steps = decompose(self.s.agent_model, augmented, project_tree(self.root))
+        except Exception:
+            return False
+        if not new_steps:
+            return False
+        self._reid(new_steps, f"r{gen}_")
+        done = [s for s in state.steps if s.status == DONE]
+        state.steps = done + new_steps               # keep what finished; retry the rest with a new plan
+        state.log.append(f"replan {gen}: {len(new_steps)} new steps after — {why[:100]}")
+        state.save(self.checkpoint_path)
+        self.emit("plan", [{"id": s.id, "goal": s.goal, "kind": s.kind, "file": s.file,
+                            "depends_on": s.depends_on} for s in new_steps])
+        return True
+
+    def _finalize(self, state: LoopState) -> LoopResult:
+        for s in state.steps:                          # anything left had a failed/blocked dependency
+            if s.status in (PENDING, RUNNING):
+                s.status = BLOCKED
+        state.save(self.checkpoint_path)
+        c = state.counts()
+        ok = state.all_done()
+        answer = (f"{c[DONE]} done, {c[FAILED]} failed, {c[BLOCKED]} blocked "
+                  f"of {len(state.steps)} steps.")
+        self.emit("loop", {"ok": ok, "answer": answer, "counts": c})
+        return LoopResult(ok, answer, state)
+
+    def _load_or_plan(self, goal: str, resume: bool) -> LoopState | None:
+        if resume and self.checkpoint_path.is_file():
+            state = LoopState.load(self.checkpoint_path)
+            for s in state.steps:                          # a step caught mid-flight at interrupt was
+                if s.status == RUNNING:                    # never finished — redo it, don't strand it
+                    s.status = PENDING
+            self.emit("note", f"Resuming: {state.counts()[DONE]} step(s) already done — continuing.")
+            return state
+        self.emit("stage", "Plan")
+        steps = decompose(self.s.agent_model, goal, project_tree(self.root))
+        if not steps:
+            self.emit("halt", "could not decompose the goal into atomic steps")
+            return None
+        state = LoopState(goal=goal, steps=steps)
+        state.save(self.checkpoint_path)
+        self.emit("plan", [{"id": s.id, "goal": s.goal, "kind": s.kind, "file": s.file,
+                            "depends_on": s.depends_on} for s in steps])
+        self.emit("note", f"Planned {len(steps)} atomic step(s).")
+        return state
+
+    def _project_symbols(self) -> dict[str, str]:
+        """Map each public top-level symbol (function/class/constant) → the module that defines it.
+        The deterministic ground truth the model keeps getting wrong."""
+        import ast
+        skip = {".venv", "node_modules", "__pycache__", ".git", ".newton", "vendor"}
+        out: dict[str, str] = {}
+        for py in self.root.rglob("*.py"):
+            rel = py.relative_to(self.root).as_posix()
+            if any(p in skip for p in py.parts) or rel.rsplit("/", 1)[-1].startswith("test_"):
+                continue
+            try:
+                tree = ast.parse(py.read_text(encoding="utf-8", errors="ignore"))
+            except (OSError, SyntaxError):
+                continue
+            mod = _module_of(rel)
+            for n in tree.body:
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not n.name.startswith("_"):
+                    out.setdefault(n.name, mod)
+                elif isinstance(n, ast.Assign):
+                    for t in n.targets:
+                        if isinstance(t, ast.Name) and not t.id.startswith("_"):
+                            out.setdefault(t.id, mod)
+        return out
+
+    def _repair_imports(self, rel: str) -> bool:
+        """Deterministically fix a written file's intra-project imports: if `from M import name`
+        names a symbol that actually lives in module M', rewrite M→M'. The model writes the logic;
+        the system guarantees the imports resolve. Leaves third-party and unknown names alone."""
+        import ast
+        path = self.root / rel
+        try:
+            src = path.read_text(encoding="utf-8")
+            tree = ast.parse(src)
+        except (OSError, SyntaxError):
+            return False
+        symbols = self._project_symbols()
+        self_mod = _module_of(rel)
+        lines = src.splitlines()
+        changed = False
+        for node in tree.body:
+            if not isinstance(node, ast.ImportFrom) or node.module is None or node.level != 0:
+                continue
+            real_mods = {symbols[a.name] for a in node.names if a.name in symbols}
+            # only act when every named symbol resolves to ONE real module that isn't what was written
+            if len(real_mods) == 1:
+                real = real_mods.pop()
+                if real != node.module and real != self_mod:
+                    ln = node.lineno - 1
+                    lines[ln] = lines[ln].replace(f"from {node.module} import", f"from {real} import", 1)
+                    changed = True
+        if changed:
+            path.write_text("\n".join(lines) + ("\n" if src.endswith("\n") else ""), encoding="utf-8")
+        return changed
+
+    def _verify(self, step: Step) -> StepResult:
+        """A RUN step's success IS its verification. A WRITE .py step must (1) parse and (2) IMPORT
+        cleanly — importing catches hallucinated/wrong module paths (`from project.pricing ...` when
+        the real module is `store.pricing`) that parsing alone misses, so the loop retries and the
+        model self-corrects with the error fed back. A missing THIRD-PARTY dep is an env gap, skipped."""
+        if step.kind == RUN or not step.file.endswith(".py"):
+            return StepResult(True, "")
+        path = self.root / step.file
+        src = path.read_text(encoding="utf-8", errors="ignore") if path.is_file() else ""
+        if not python_parses(src):
+            return StepResult(False, f"{step.file} does not parse")
+
+        module = _module_of(step.file)
+        out = ToolBelt(self.root).run(cmd=f'"{sys.executable}" -c "import {module}"')
+        if out.startswith("[exit 0]"):
+            return StepResult(True, "")
+        body = out.split("]", 1)[-1].strip()
+        miss = re.search(r"No module named ['\"]([\w.]+)['\"]", body)
+        if miss and miss.group(1).split(".")[0] in _EXTERNAL_DEPS:
+            return StepResult(True, "")                 # real third-party dep, not a code bug
+        return StepResult(False, f"import of {step.file} failed: {body[:200]}")

@@ -1,0 +1,12 @@
+{
+  "name": "newton",
+  "private": true,
+  "version": "0.1.0",
+  "description": "A fully-local, Claude-Code-style coding and project assistant. Monorepo: Python backend + React frontend.",
+  "workspaces": ["frontend"],
+  "scripts": {
+    "dev": "npm --workspace frontend run dev",
+    "build": "npm --workspace frontend run build",
+    "preview": "npm --workspace frontend run preview"
+  }
+}

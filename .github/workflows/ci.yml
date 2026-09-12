@@ -32,12 +32,12 @@ jobs:
           node-version: "20"
       - name: Install
         working-directory: frontend
-        # Work around npm's optional-dependency bug (npm/cli#4828): with the committed lockfile
-        # present, both `npm ci` and `npm install` skip the platform rollup binary on Linux and
-        # `vite build` crashes ("Cannot find module @rollup/rollup-linux-x64-gnu"). Removing the
-        # lockfile forces npm to resolve optional deps fresh for the runner's platform.
+        # The npm bundled with the runner (npm 10.x) carries npm/cli#4828: it skips the platform
+        # rollup binary on Linux, so `vite build` crashes ("Cannot find module
+        # @rollup/rollup-linux-x64-gnu") even after a fresh install. npm 11 fixes the bug — upgrade
+        # first, then a clean reproducible install from the lockfile.
         run: |
-          rm -f package-lock.json
+          npm install -g npm@latest
           npm install
       - name: Build
         working-directory: frontend

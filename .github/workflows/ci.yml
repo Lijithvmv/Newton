@@ -37,7 +37,7 @@ jobs:
         # @rollup/rollup-linux-x64-gnu") even after a fresh install. npm 11 fixes the bug — upgrade
         # first, then a clean reproducible install from the lockfile.
         run: |
-          npm install -g npm@latest
+          npm install -g npm@11
           npm install
       - name: Build
         working-directory: frontend

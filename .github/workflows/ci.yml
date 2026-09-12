@@ -32,13 +32,14 @@ jobs:
           node-version: "20"
       - name: Install
         working-directory: frontend
-        # The npm bundled with the runner (npm 10.x) carries npm/cli#4828: it skips the platform
-        # rollup binary on Linux, so `vite build` crashes ("Cannot find module
-        # @rollup/rollup-linux-x64-gnu") even after a fresh install. npm 11 fixes the bug — upgrade
-        # first, then a clean reproducible install from the lockfile.
+        # npm/cli#4828: npm won't install rollup's platform-specific optional binary on Linux
+        # (persists across npm 10 and 11, with or without the lockfile), so `vite build` crashes
+        # with "Cannot find module @rollup/rollup-linux-x64-gnu". The runner is always ubuntu x64,
+        # so after the normal install we add that exact binary explicitly — a direct (non-optional)
+        # install that npm's optional-dep bug can't skip.
         run: |
-          npm install -g npm@11
-          npm install
+          npm ci
+          npm install @rollup/rollup-linux-x64-gnu --no-save
       - name: Build
         working-directory: frontend
         run: npm run build

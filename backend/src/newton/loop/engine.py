@@ -432,7 +432,7 @@ class LoopEngine:
                   "the goal clearly specifies; do not invent requirements. Every assertion MUST live "
                   "inside a `def test_...():` function — pytest runs functions named test_*, NOT bare "
                   "module-level asserts."))
-        run_step = Step(id="v_run", kind=RUN, command='{py} -m pytest -q test_generated.py',
+        run_step = Step(id="v_run", kind=RUN, command='{py} -B -m pytest -q test_generated.py',
                         goal="run the generated check", depends_on=["v_test"])
         state.steps += [test_step, run_step]
         state.save(self.checkpoint_path)
@@ -463,7 +463,7 @@ class LoopEngine:
             self.emit("note", "Skipping the whole-app check — couldn't prepare its dependencies.")
             return
         self.emit("note", "Checking the whole app loads together…")
-        step = Step(id="i_run", kind=RUN, command=f'"{py}" -c "import {entry}"',
+        step = Step(id="i_run", kind=RUN, command=f'"{py}" -B -c "import {entry}"',
                     goal=f"import {entry} — confirm the assembled app loads")
         state.steps.append(step)
         state.save(self.checkpoint_path)
@@ -656,7 +656,7 @@ class LoopEngine:
             return StepResult(False, f"{step.file} does not parse")
 
         module = _module_of(step.file)
-        out = ToolBelt(self.root).run(cmd=f'"{sys.executable}" -c "import {module}"')
+        out = ToolBelt(self.root).run(cmd=f'"{sys.executable}" -B -c "import {module}"')
         if out.startswith("[exit 0]"):
             return StepResult(True, "")
         body = out.split("]", 1)[-1].strip()

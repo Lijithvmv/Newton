@@ -57,7 +57,9 @@ class ExploreEngine:
     def _detect_check(self) -> str | None:
         for p in self.root.rglob("test_*.py"):
             if ".venv" not in p.parts and "node_modules" not in p.parts:
-                return "{py} -m pytest -q"
+                # -B: never write .pyc — so a same-size edit (a-b → a+b) re-run in the same
+                # filesystem-second can't be masked by stale timestamp-invalidated bytecode.
+                return "{py} -B -m pytest -q"
         return None
 
     def _run_check(self, check: str) -> tuple[bool, str]:

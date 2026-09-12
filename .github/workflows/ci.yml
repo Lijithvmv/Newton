@@ -32,7 +32,9 @@ jobs:
           node-version: "20"
       - name: Install
         working-directory: frontend
-        run: npm ci
+        # npm install (not `npm ci`) works around npm's optional-dependency bug (npm/cli#4828)
+        # where `npm ci` fails to install the platform rollup binary on Linux → vite build crashes.
+        run: npm install
       - name: Build
         working-directory: frontend
         run: npm run build

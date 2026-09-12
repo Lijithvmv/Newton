@@ -128,7 +128,7 @@ class Memory:
 
     # --- verify (promote to top trust) ---------------------------------
 
-    def verify(self, match: str) -> "MemoryItem | None":
+    def verify(self, match: str) -> MemoryItem | None:
         """Promote the memory that best matches `match` to `origin='verified'` — the operator
         explicitly confirming a fact, so it recalls above any unconfirmed memory. Semantic match
         when an embedder is available, else a substring match on the text. Rewrites the store in

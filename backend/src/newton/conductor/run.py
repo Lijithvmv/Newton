@@ -95,7 +95,7 @@ def main(argv=None):
     print(DIM("staged context injection: Understand → Retrieve → Plan → Edit → Verify → Remember"))
     print(B(f"\n▸ {' '.join(parts)}"))
 
-    conductor = Conductor(settings, emit=_emit, approve=_approver(auto))
+    conductor = Conductor(settings, emit=_emit, approve=_approver(auto), auto_approve=auto)
     result = conductor.run(" ".join(parts))
 
     print(("\n" + GR("✓ SUCCESS") if result.ok else "\n" + RE("✕ HALTED")) +

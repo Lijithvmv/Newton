@@ -6,7 +6,13 @@ text's embedding. Two properties beyond plain semantic recall:
 
   * salience — a near-duplicate of an existing memory is not stored, so memory stays lean;
   * graph recall — a query can be scoped to files/symbols, so "what have we done to X?"
-    returns the memories that actually touched X, not just ones that sound similar.
+    returns the memories that actually touched X, not just ones that sound similar;
+  * provenance — every item records its `origin` (verified | user | agent | import | tool); recall
+    weights similarity by trust, so a fact distilled from untrusted tool output can't resurface with
+    the authority of one the operator confirmed (relevance hygiene *and* prompt-injection defence).
+    `verify()` promotes a memory to `verified` (top trust) — the operator confirming a fact;
+  * decay — recall also weights by an Ebbinghaus half-life, so fresh work outranks equally-similar
+    stale work over Newton's long, unbounded runs — without ever deleting anything.
 
 Reuses Newton's own embedder rather than pulling in Mem0/Chroma — fully local.
 """
@@ -24,6 +30,50 @@ from ..index.embeddings import cosine
 RECALL_THRESHOLD = 0.55   # cosine below this is "not relevant enough" for semantic recall
 DEDUP_THRESHOLD = 0.92    # cosine at/above this means "we already remember essentially this"
 
+# --- provenance: where a memory came from, and how far we trust it -------
+#
+# Memory is written from inside the loop (the Remember step), so a fact distilled from raw tool
+# output would otherwise be recalled with the SAME weight as one the user confirmed — which is both
+# a relevance problem and a prompt-injection hole (a malicious line in tool output could resurface
+# as if it were an instruction). Every item carries an immutable `origin`; recall multiplies the
+# similarity by a trust weight, so untrusted origins must clear a higher relevance bar to surface.
+TRUST_WEIGHTS = {
+    "verified": 1.3,  # the operator EXPLICITLY confirmed this fact (promoted via verify()) — top trust
+    "user": 1.0,      # a human-attended run (the operator was in the loop and approved the work)
+    "agent": 0.9,     # Newton's own distilled conclusion (the default; unattended runs; legacy lines)
+    "import": 0.75,   # ingested external document
+    "tool": 0.5,      # raw command / tool output — untrusted; may carry injected text
+}
+DEFAULT_ORIGIN = "agent"
+
+# --- decay: memory of a long-running agent must stay lean AND recent -----
+#
+# Newton's edge is unlimited-time runs, so .newton/memory.jsonl accumulates heavily. Nothing is
+# deleted, but recall weights an item by an Ebbinghaus-style half-life: a memory's pull halves
+# every HALF_LIFE_DAYS, so fresh work outranks equally-similar stale work without any pruning.
+HALF_LIFE_DAYS = 30.0
+
+
+def trust_weight(origin: str) -> float:
+    """Trust multiplier for an origin; unknown origins fall back to the agent default."""
+    return TRUST_WEIGHTS.get(origin, TRUST_WEIGHTS[DEFAULT_ORIGIN])
+
+
+def recency_weight(ts: str, now: datetime | None = None) -> float:
+    """Ebbinghaus decay in [0, 1]: 1.0 for a just-written memory, halving every HALF_LIFE_DAYS.
+    A missing or unparseable timestamp is treated as no decay (weight 1.0) — never penalised."""
+    if not ts:
+        return 1.0
+    try:
+        t = datetime.fromisoformat(ts)
+    except ValueError:
+        return 1.0
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    age_days = max(0.0, (now - t).total_seconds() / 86400.0)
+    return 0.5 ** (age_days / HALF_LIFE_DAYS)
+
 
 @dataclass
 class MemoryItem:
@@ -32,12 +82,14 @@ class MemoryItem:
     files: list[str] = field(default_factory=list)
     symbols: list[str] = field(default_factory=list)
     kind: str = "task"
+    origin: str = DEFAULT_ORIGIN            # provenance: user | agent | tool | import
     ts: str = ""
     embedding: list[float] | None = None
 
     def to_json(self) -> dict[str, Any]:
-        return {"ts": self.ts, "kind": self.kind, "text": self.text, "request": self.request,
-                "files": self.files, "symbols": self.symbols, "embedding": self.embedding}
+        return {"ts": self.ts, "kind": self.kind, "origin": self.origin, "text": self.text,
+                "request": self.request, "files": self.files, "symbols": self.symbols,
+                "embedding": self.embedding}
 
 
 class Memory:
@@ -48,8 +100,10 @@ class Memory:
     # --- write (with salience) -----------------------------------------
 
     def add(self, text: str, *, request: str = "", files: list[str] | None = None,
-            symbols: list[str] | None = None, kind: str = "task") -> MemoryItem | None:
+            symbols: list[str] | None = None, kind: str = "task",
+            origin: str = DEFAULT_ORIGIN) -> MemoryItem | None:
         """Store a memory — unless it is a near-duplicate of one we already hold (salience).
+        `origin` records provenance (user | agent | tool | import) and governs recall trust.
         Returns the stored item, or None if it was skipped as redundant."""
         embedding = None
         if self.embedder is not None:
@@ -64,12 +118,46 @@ class Memory:
                 if it.embedding and cosine(embedding, it.embedding) >= DEDUP_THRESHOLD:
                     return None
         item = MemoryItem(text=text, request=request, files=files or [], symbols=symbols or [],
-                          kind=kind, ts=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                          kind=kind, origin=origin,
+                          ts=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                           embedding=embedding)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(item.to_json()) + "\n")
         return item
+
+    # --- verify (promote to top trust) ---------------------------------
+
+    def verify(self, match: str) -> "MemoryItem | None":
+        """Promote the memory that best matches `match` to `origin='verified'` — the operator
+        explicitly confirming a fact, so it recalls above any unconfirmed memory. Semantic match
+        when an embedder is available, else a substring match on the text. Rewrites the store in
+        place; returns the promoted item, or None if nothing matched. Idempotent."""
+        items = self.all()
+        if not items:
+            return None
+        target: MemoryItem | None = None
+        if self.embedder is not None and self.embedder.available():
+            qv = self.embedder.embed([match])[0]
+            scored = sorted(((cosine(qv, it.embedding), it) for it in items if it.embedding),
+                            key=lambda x: x[0], reverse=True)
+            if scored and scored[0][0] >= RECALL_THRESHOLD:
+                target = scored[0][1]
+        if target is None:                                   # fallback: literal substring match
+            m = match.lower()
+            target = next((it for it in items if m in it.text.lower()), None)
+        if target is None:
+            return None
+        target.origin = "verified"
+        self._rewrite(items)
+        return target
+
+    def _rewrite(self, items: list[MemoryItem]) -> None:
+        """Atomically rewrite the whole store (used by verify — add() only ever appends)."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text("".join(json.dumps(it.to_json()) + "\n" for it in items), encoding="utf-8")
+        tmp.replace(self.path)
 
     # --- read ----------------------------------------------------------
 
@@ -85,7 +173,8 @@ class Memory:
             items.append(MemoryItem(
                 text=d.get("text") or d.get("request", ""), request=d.get("request", ""),
                 files=d.get("files", []), symbols=d.get("symbols", []),
-                kind=d.get("kind", "task"), ts=d.get("ts", ""), embedding=d.get("embedding"),
+                kind=d.get("kind", "task"), origin=d.get("origin", DEFAULT_ORIGIN),
+                ts=d.get("ts", ""), embedding=d.get("embedding"),
             ))
         return items
 
@@ -113,9 +202,21 @@ class Memory:
                 if self.embedder.available():
                     semantic_ok = True
                     qv = self.embedder.embed([query])[0]
-                    scored = [(cosine(qv, it.embedding), it) for it in items if it.embedding]
+                    now = datetime.now(timezone.utc)
+                    scored: list[tuple[float, MemoryItem]] = []
+                    for it in items:
+                        if not it.embedding:
+                            continue
+                        sim = cosine(qv, it.embedding)
+                        if sim < RECALL_THRESHOLD:          # relevance gate on RAW similarity
+                            continue
+                        # Rank survivors by trust- and recency-weighted similarity: an untrusted
+                        # (e.g. tool-origin) or stale memory must be far more similar to outrank a
+                        # trusted, recent one — injection defence and lean recall in one score.
+                        weight = sim * trust_weight(it.origin) * recency_weight(it.ts, now)
+                        scored.append((weight, it))
                     scored.sort(key=lambda x: x[0], reverse=True)
-                    sem_hits = [it for s, it in scored if s >= RECALL_THRESHOLD]
+                    sem_hits = [it for _, it in scored]
             except Exception:
                 semantic_ok = False
         if not semantic_ok and not graph_hits:

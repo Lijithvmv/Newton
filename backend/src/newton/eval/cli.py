@@ -20,7 +20,14 @@ def main() -> None:
     ap.add_argument("--reps", type=int, default=3, help="runs per task per arm (variance)")
     ap.add_argument("--arms", default="baseline,loop", help="comma list: baseline,newton,loop")
     ap.add_argument("--task", default="", help="run only this task id")
+    ap.add_argument("--memory", action="store_true",
+                    help="run the model-free memory-recall eval (provenance + decay) and exit")
     args = ap.parse_args()
+
+    if args.memory:
+        from .memory_eval import report as memory_report
+        print(memory_report())
+        return
 
     suite = {"hard": HARD_TASKS, "large": LARGE_TASKS}.get(args.suite, SEED_TASKS)
     tasks = [t for t in suite if not args.task or t.id == args.task]

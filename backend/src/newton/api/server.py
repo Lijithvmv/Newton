@@ -121,7 +121,7 @@ class RunManager:
                 answer = f"Drafted {doc.path}" if doc.ok else "Document not saved."
                 run.events.put({"ch": "done", "payload": {"ok": doc.ok, "answer": answer, "stages": []}})
             else:
-                result = Conductor(settings, emit=emit, approve=approve).run(task)
+                result = Conductor(settings, emit=emit, approve=approve, auto_approve=auto).run(task)
                 run.events.put({"ch": "done", "payload": {
                     "ok": result.ok, "answer": result.answer, "stages": result.stages}})
         except Exception as e:  # never leave the stream hanging on an engine crash
@@ -261,6 +261,24 @@ async def memory() -> dict:
             except json.JSONDecodeError:
                 continue
     return {"entries": list(reversed(entries))}
+
+
+class VerifyReq(BaseModel):
+    match: str
+
+
+@app.post("/api/memory/verify")
+async def verify_memory(req: VerifyReq) -> dict:
+    """Promote the memory that best matches `match` to 'verified' (top recall trust) — the operator
+    confirming a fact so it outranks any unconfirmed memory."""
+    from ..index.embeddings import Embedder
+    from ..memory import Memory
+
+    mem = Memory(_REPO_ROOT / ".newton" / "memory.jsonl", embedder=Embedder())
+    item = mem.verify(req.match)
+    if item is None:
+        return {"ok": False, "detail": "no matching memory found"}
+    return {"ok": True, "verified": {"text": item.text, "origin": item.origin, "ts": item.ts}}
 
 
 @app.get("/api/components")

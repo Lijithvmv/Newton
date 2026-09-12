@@ -6,6 +6,16 @@ task can be informed by relevant past work. Degrades gracefully to recency when 
 embedding model is available.
 """
 
-from .store import Memory, MemoryItem
+from .store import (
+    HALF_LIFE_DAYS,
+    TRUST_WEIGHTS,
+    Memory,
+    MemoryItem,
+    recency_weight,
+    trust_weight,
+)
 
-__all__ = ["Memory", "MemoryItem"]
+__all__ = [
+    "Memory", "MemoryItem", "trust_weight", "recency_weight",
+    "TRUST_WEIGHTS", "HALF_LIFE_DAYS",
+]

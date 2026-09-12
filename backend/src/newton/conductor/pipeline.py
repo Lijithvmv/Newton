@@ -221,11 +221,15 @@ class ConductorResult:
 
 class Conductor:
     def __init__(self, settings: Settings, *, emit: Emit, approve: Approve,
-                 learn_skills: bool = True) -> None:
+                 learn_skills: bool = True, auto_approve: bool = True) -> None:
         self.s = settings
         self.belt = ToolBelt(settings.project_root)
         self.emit = emit
         self.approve = approve
+        # Whether this run is unattended. A human-attended run (auto_approve=False) means the operator
+        # reviewed and approved the work, so its distilled memory is written with higher trust
+        # (`user`) than a fully-autonomous run's (`agent`). See memory provenance.
+        self.auto_approve = auto_approve
         # Whether a successful task may distill a reusable skill. Off for Build sub-tasks so a
         # project's many small file-tasks don't each spawn a skill.
         self.learn_skills = learn_skills
@@ -883,7 +887,8 @@ class Conductor:
                 + (f" (defines {', '.join(symbols)})" if symbols else "")
                 + (f"\nApproach: {decisions}" if decisions else ""))
         stored = self.memory.add(text, request=self.state.goal.request,
-                                 files=files, symbols=symbols, kind="task")
+                                 files=files, symbols=symbols, kind="task",
+                                 origin=("agent" if self.auto_approve else "user"))
         self.state.note(text)
         self.emit("note", "Remembered this task (semantic memory)."
                   if stored else "Already remembered something like this — not duplicating (salience).")

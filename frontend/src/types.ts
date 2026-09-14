@@ -8,6 +8,10 @@ export type DocType = "prd" | "architecture" | "brainstorm" | "design";
 // Report types the Report mode can generate (sent as the run's `task`).
 export type ReportType = "status" | "architecture" | "progress";
 
+// How much free local compute a Build spends to reach verified quality (loop/effort.py).
+export type EffortLevel = "quick" | "normal" | "thorough" | "max";
+export const EFFORTS: EffortLevel[] = ["quick", "normal", "thorough", "max"];
+
 export interface RunRequest {
   task: string;
   project: string;
@@ -15,6 +19,7 @@ export interface RunRequest {
   auto: boolean;
   mode: Mode;
   doc_type?: DocType;
+  effort?: EffortLevel;
 }
 
 export interface ContextBlock {

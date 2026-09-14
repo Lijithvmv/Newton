@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import Settings
+from .effort import Effort
 from .engine import LoopEngine, LoopResult
 
 # Never copied into an attempt (seeding) or back out of it (materialising): Newton's own state, the
@@ -59,13 +60,16 @@ class BestOfNResult:
 class BestOfN:
     def __init__(self, settings: Settings, n: int, *,
                  emit: Callable[[str, Any], None] | None = None,
+                 effort: Effort | None = None,
                  make_engine: Callable[[Settings, Callable], Any] | None = None) -> None:
         self.s = settings
         self.n = max(1, int(n))
         self.emit = emit or (lambda *a: None)
+        self.effort = effort
         self.root = Path(settings.project_root)
-        # Injectable so tests can script attempts without a model; default is a real LoopEngine.
-        self._make_engine = make_engine or (lambda st, emit: LoopEngine(st, emit=emit))
+        # Injectable so tests can script attempts without a model; default is a real LoopEngine that
+        # inherits this run's effort level (each isolated attempt spends the same per-attempt budget).
+        self._make_engine = make_engine or (lambda st, emit: LoopEngine(st, emit=emit, effort=self.effort))
 
     def run(self, goal: str, *, resume: bool = False) -> BestOfNResult:
         if self.n == 1:                                    # opt-in: N==1 is today's in-place run

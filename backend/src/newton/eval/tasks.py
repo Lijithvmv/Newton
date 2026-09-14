@@ -146,3 +146,192 @@ LARGE_TASKS: list[EvalTask] = [
         files=_large_repo_files(),
     ),
 ]
+
+
+# The REAL-PRODUCT regime: build a whole small application from scratch, spanning several modules that
+# must cohere, checked by RUNNING it (not just importing). These are meant to be HARD for a 7B on the
+# first pass — real business logic (atomic transactions, error semantics) and a service that must
+# actually start and serve — so the effort curve has room to bend. This is where we find what's
+# lacking. The checker is stdlib-only so it runs in Newton's own interpreter with no dependency install.
+
+_LEDGER_TEST = '''\
+import pytest
+from service import Ledger
+
+# Each test gets its OWN db file via pytest's tmp_path, so nothing has to delete a file another
+# connection may still hold open (that would be a Windows file-lock artifact, not a logic result).
+
+
+def _ledger(tmp_path):
+    return Ledger(str(tmp_path / "ledger.db"))
+
+
+def test_open_and_balance(tmp_path):
+    lg = _ledger(tmp_path)
+    a = lg.open_account("alice", 10000)
+    assert lg.balance(a) == 10000
+
+
+def test_transfer_moves_money_and_conserves_total(tmp_path):
+    lg = _ledger(tmp_path)
+    a = lg.open_account("alice", 10000)
+    b = lg.open_account("bob", 0)
+    lg.transfer(a, b, 3000)
+    assert lg.balance(a) == 7000
+    assert lg.balance(b) == 3000
+    assert lg.balance(a) + lg.balance(b) == 10000
+
+
+def test_overdraft_raises_and_is_atomic(tmp_path):
+    lg = _ledger(tmp_path)
+    a = lg.open_account("alice", 100)
+    b = lg.open_account("bob", 0)
+    with pytest.raises(ValueError):
+        lg.transfer(a, b, 500)
+    assert lg.balance(a) == 100      # a failed transfer must leave both balances untouched
+    assert lg.balance(b) == 0
+
+
+def test_persistence_across_reopen(tmp_path):
+    path = str(tmp_path / "ledger.db")
+    lg = Ledger(path)
+    a = lg.open_account("alice", 5000)
+    b = lg.open_account("bob", 0)
+    lg.transfer(a, b, 2000)
+    lg2 = Ledger(path)               # reopen the SAME sqlite file
+    assert lg2.balance(a) == 3000
+    assert lg2.balance(b) == 2000
+'''
+
+_URLSHORT_CHECK = '''\
+import json
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+
+def _free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+def main():
+    port = _free_port()
+    proc = subprocess.Popen([sys.executable, "app.py", "--port", str(port)])
+    base = "http://127.0.0.1:%d" % port
+    try:
+        up = False
+        for _ in range(50):
+            if proc.poll() is not None:
+                print("server process exited early, code", proc.returncode)
+                return 1
+            try:
+                urllib.request.urlopen(base + "/__ping__", timeout=1)
+                up = True
+                break
+            except urllib.error.HTTPError:
+                up = True           # any HTTP response means it is serving
+                break
+            except Exception:
+                time.sleep(0.2)
+        if not up:
+            print("server did not start")
+            return 1
+
+        req = urllib.request.Request(
+            base + "/shorten",
+            data=json.dumps({"url": "https://example.com/page"}).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        code = json.loads(urllib.request.urlopen(req, timeout=3).read().decode())["code"]
+        assert code, "no code returned from /shorten"
+
+        opener = urllib.request.build_opener(_NoRedirect)
+        try:
+            opener.open(base + "/" + code, timeout=3)
+            print("expected a 302 redirect, got a 2xx")
+            return 1
+        except urllib.error.HTTPError as e:
+            if e.code != 302:
+                print("expected 302, got", e.code)
+                return 1
+            if e.headers.get("Location") != "https://example.com/page":
+                print("bad Location header:", e.headers.get("Location"))
+                return 1
+
+        try:
+            urllib.request.urlopen(base + "/zzznope", timeout=3)
+            print("expected 404 for an unknown code")
+            return 1
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                print("expected 404, got", e.code)
+                return 1
+
+        print("OK")
+        return 0
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+REAL_TASKS: list[EvalTask] = [
+    # A) Real business logic + persistence + atomic error semantics, across two modules.
+    EvalTask(
+        id="ledger",
+        goal=(
+            "Build a persistent bank ledger in this project using ONLY the Python standard library "
+            "(sqlite3), split across two modules:\n"
+            "- `db.py`: a function `connect(path)` that returns a sqlite3 connection to the database "
+            "file at `path`, and `init_db(conn)` that creates the tables you need (an accounts table "
+            "with an integer id, a name, and an integer balance in cents).\n"
+            "- `service.py`: a class `Ledger` with:\n"
+            "    * `__init__(self, path)` — open/create the sqlite database at `path` (use db.py) and "
+            "initialise it;\n"
+            "    * `open_account(self, name, opening_balance=0)` — create an account and return its "
+            "integer id;\n"
+            "    * `balance(self, account_id)` — return the account's integer balance;\n"
+            "    * `transfer(self, src_id, dst_id, amount)` — move `amount` cents from src to dst. It "
+            "MUST raise `ValueError` if either account does not exist OR the source has insufficient "
+            "funds, and on that error it must NOT change any balance (atomic).\n"
+            "All balances must persist in the sqlite file, so reopening `Ledger(path)` on the same "
+            "path sees them. Do not modify the test file."),
+        target="",
+        files={"test_ledger.py": _LEDGER_TEST},
+        check='{py} -B -m pytest -q test_ledger.py',
+    ),
+    # B) A service that must ACTUALLY RUN and serve HTTP — the "assembled app doesn't start" gap.
+    EvalTask(
+        id="urlshort",
+        goal=(
+            "Build a URL shortener as a RUNNABLE web service in `app.py`, using ONLY the Python "
+            "standard library (http.server + sqlite3 — no third-party packages). Running "
+            "`python app.py --port <PORT>` must start the server on that port. Endpoints:\n"
+            "- `POST /shorten` with a JSON body {\"url\": \"<the url>\"} → respond 200 with a JSON "
+            "body {\"code\": \"<short code>\"}; generate a short code and store the code→url mapping.\n"
+            "- `GET /<code>` → if the code exists, respond with HTTP status 302 and a `Location` "
+            "header equal to the original url; if it does not exist, respond 404.\n"
+            "Persist the code→url mapping in a sqlite database file so it survives a restart. Read the "
+            "port from the `--port` command-line argument. Do not modify the check file."),
+        target="",
+        files={"check.py": _URLSHORT_CHECK},
+        check='{py} -B check.py',
+    ),
+]

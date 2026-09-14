@@ -22,6 +22,25 @@ export async function startRun(req: RunRequest): Promise<string> {
   return d.run_id as string;
 }
 
+export interface Savings {
+  calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  baseline_model: string;
+  saved_usd: number;
+  estimated: boolean;
+  note: string;
+}
+/** The cloud-cost-avoided meter — what local (free) inference would have cost on a cloud API. */
+export async function fetchSavings(): Promise<Savings | null> {
+  try {
+    const r = await fetch("/api/savings");
+    return (await r.json()) as Savings;
+  } catch {
+    return null;
+  }
+}
+
 export interface IntakeResult {
   ok: boolean;
   dest?: string;
@@ -134,3 +153,53 @@ export async function fetchMemory(): Promise<any[]> {
   const r = await fetch("/api/memory");
   return (await r.json()).entries ?? [];
 }
+
+export interface RunActivity {
+  id: string;
+  task: string;
+  mode: string;
+  status: "running" | "done" | "failed" | string;
+  started: number;
+  ok: boolean;
+}
+/** Recent runs (in-progress + lately finished) for the activity feed. */
+export async function fetchRuns(): Promise<RunActivity[]> {
+  try {
+    const r = await fetch("/api/runs");
+    return (await r.json()).runs ?? [];
+  } catch {
+    return [];
+  }
+}
+
+export interface ProposedMemory {
+  text: string;
+  origin: string;
+  status: string;
+  ts?: number;
+  files?: string[];
+  symbols?: string[];
+}
+/** Quarantined memories (untrusted origin) awaiting the operator's activate/reject decision. */
+export async function fetchProposedMemory(): Promise<ProposedMemory[]> {
+  try {
+    const r = await fetch("/api/memory/proposed");
+    return (await r.json()).entries ?? [];
+  } catch {
+    return [];
+  }
+}
+async function memoryDecision(action: "activate" | "reject" | "verify", match: string) {
+  const r = await fetch(`/api/memory/${action}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ match }),
+  });
+  return r.json() as Promise<{ ok: boolean; detail?: string }>;
+}
+/** Pass the activation gate: a quarantined memory becomes eligible for recall. */
+export const activateMemory = (match: string) => memoryDecision("activate", match);
+/** Decline a memory: never recalled (kept on disk for audit). */
+export const rejectMemory = (match: string) => memoryDecision("reject", match);
+/** Promote a memory to 'verified' — the operator confirming a fact so it outranks the rest. */
+export const verifyMemory = (match: string) => memoryDecision("verify", match);

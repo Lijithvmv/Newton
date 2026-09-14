@@ -13,6 +13,7 @@ unlimited time) turned into Claude-class output on tasks a naive prompt can't do
 """
 
 from .bestofn import Attempt, BestOfN, BestOfNResult
+from .effort import DEFAULT, LEVELS, ORDER, Effort, effort
 from .engine import ContextShaper, LoopEngine, LoopResult, RetrievalShaper
 from .execute import NativeStepExecutor, StepExecutor, StepResult
 from .explore import ExploreEngine, ExploreResult
@@ -24,5 +25,6 @@ __all__ = [
     "ExploreEngine", "ExploreResult",
     "ContextShaper", "RetrievalShaper",
     "StepExecutor", "NativeStepExecutor", "StepResult",
+    "Effort", "effort", "LEVELS", "ORDER", "DEFAULT",
     "PENDING", "RUNNING", "DONE", "FAILED",
 ]

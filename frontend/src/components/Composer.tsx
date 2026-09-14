@@ -1,6 +1,7 @@
 import { useLayoutEffect, useRef, useState } from "react";
 import { uploadDocument } from "../api";
-import type { DocType, Mode, ReportType } from "../types";
+import type { DocType, EffortLevel, Mode, ReportType } from "../types";
+import { EFFORTS } from "../types";
 import { Icon } from "./icons";
 import { ProjectPicker } from "./ProjectPicker";
 
@@ -17,6 +18,8 @@ export function Composer({
   setDocType,
   reportType,
   setReportType,
+  effort,
+  setEffort,
   running,
   onRun,
   onStop,
@@ -31,6 +34,8 @@ export function Composer({
   setDocType: (d: DocType) => void;
   reportType: ReportType;
   setReportType: (r: ReportType) => void;
+  effort: EffortLevel;
+  setEffort: (e: EffortLevel) => void;
   running: boolean;
   onRun: (task: string) => void;
   onStop: () => void;
@@ -89,46 +94,15 @@ export function Composer({
       onDragLeave={() => setDragover(false)}
       onDrop={onDrop}
     >
-      <div className="toolbar">
-        <button className="tool" onClick={() => setPicking(true)} title={`Linked folder: ${project}`}>
-          <Icon name="folder" size={14} />
-          <span className="toolname">{projName}</span>
-        </button>
-        <input
-          ref={fileRef}
-          type="file"
-          hidden
-          multiple
-          accept=".pdf,.docx,.pptx,.xlsx,.html,.htm,.md,.txt,.csv,.json,.epub,.png,.jpg,.jpeg,.gif,.webp"
-          onChange={(e) => onFiles(e.target.files)}
-        />
-        <button className="tool" onClick={() => fileRef.current?.click()} title="Attach documents and images">
-          <Icon name="paperclip" size={14} /> Attach
-        </button>
-        {onSkills && (
-          <button className="tool" onClick={onSkills} title="View and add skills">
-            <Icon name="zap" size={14} /> Skills
-          </button>
-        )}
-        {mode === "author" && (
-          <select className="toolsel" value={docType} onChange={(e) => setDocType(e.target.value as DocType)} title="Document type">
-            {DOC_TYPES.map((d) => <option key={d} value={d}>{d}</option>)}
-          </select>
-        )}
-        {mode === "report" && (
-          <select className="toolsel" value={reportType} onChange={(e) => setReportType(e.target.value as ReportType)} title="Report type">
-            {REPORT_TYPES.map((r) => <option key={r} value={r}>{r}</option>)}
-          </select>
-        )}
-        <span className="sp" />
-        {mode !== "chat" && mode !== "report" && (
-          <label className="auto">
-            <input type="checkbox" checked={auto} onChange={(e) => setAuto(e.target.checked)} />
-            <span>auto-approve</span>
-          </label>
-        )}
-      </div>
       {intake && <div className="intakestatus">{intake}</div>}
+      <input
+        ref={fileRef}
+        type="file"
+        hidden
+        multiple
+        accept=".pdf,.docx,.pptx,.xlsx,.html,.htm,.md,.txt,.csv,.json,.epub,.png,.jpg,.jpeg,.gif,.webp"
+        onChange={(e) => onFiles(e.target.files)}
+      />
       <div className={`cbox ${running ? "busy" : ""}`}>
         {mode === "report" ? (
           <div className="reporthint">
@@ -158,22 +132,66 @@ export function Composer({
             }
           />
         )}
-        {running ? (
-          <button className="stop" onClick={onStop} title="Stop">
-            <span className="stopglyph" />
-          </button>
-        ) : (
-          <button
-            className="send"
-            onClick={submit}
-            disabled={mode !== "report" && !task.trim()}
-            title="Send"
-          >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-              <path d="M12 19V5M5 12l7-7 7 7" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" />
-            </svg>
-          </button>
-        )}
+        <div className="cbar">
+          <div className="ctools">
+            <button className="tool" onClick={() => setPicking(true)} title={`Linked folder: ${project}`}>
+              <Icon name="folder" size={15} />
+              <span className="toolname">{projName}</span>
+            </button>
+            <button className="tool icon" onClick={() => fileRef.current?.click()} title="Attach documents and images">
+              <Icon name="paperclip" size={16} />
+            </button>
+            {onSkills && (
+              <button className="tool icon" onClick={onSkills} title="View and add skills">
+                <Icon name="zap" size={16} />
+              </button>
+            )}
+            {mode === "author" && (
+              <select className="toolsel" value={docType} onChange={(e) => setDocType(e.target.value as DocType)} title="Document type">
+                {DOC_TYPES.map((d) => <option key={d} value={d}>{d}</option>)}
+              </select>
+            )}
+            {mode === "report" && (
+              <select className="toolsel" value={reportType} onChange={(e) => setReportType(e.target.value as ReportType)} title="Report type">
+                {REPORT_TYPES.map((r) => <option key={r} value={r}>{r}</option>)}
+              </select>
+            )}
+            {mode === "project" && (
+              <select
+                className="toolsel"
+                value={effort}
+                onChange={(e) => setEffort(e.target.value as EffortLevel)}
+                title="Effort — how much local compute to spend for quality. Higher = more attempts, wider retrieval, more replans, more verified whole-build attempts."
+              >
+                {EFFORTS.map((e) => <option key={e} value={e}>effort: {e}</option>)}
+              </select>
+            )}
+          </div>
+          <div className="cright">
+            {mode !== "chat" && mode !== "report" && (
+              <label className="auto">
+                <input type="checkbox" checked={auto} onChange={(e) => setAuto(e.target.checked)} />
+                <span>auto-approve</span>
+              </label>
+            )}
+            {running ? (
+              <button className="stop" onClick={onStop} title="Stop">
+                <span className="stopglyph" />
+              </button>
+            ) : (
+              <button
+                className="send"
+                onClick={submit}
+                disabled={mode !== "report" && !task.trim()}
+                title="Send"
+              >
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none">
+                  <path d="M12 19V5M5 12l7-7 7 7" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </button>
+            )}
+          </div>
+        </div>
       </div>
       <div className="hint">
         Newton stages the work and asks before every write · runs fully local ·{" "}

@@ -85,9 +85,14 @@ export function WikiPanel() {
       </div>
       {files.length === 0 ? (
         <div className="panelbody">
-          <div className="pempty">
-            No wiki pages yet. When a task establishes a reusable pattern, Newton records it here —
-            or curate pages by hand with <code>newton-wiki</code>.
+          <div className="emptystate">
+            <div className="esmark"><Icon name="layers" size={24} /></div>
+            <h3>No wiki pages yet</h3>
+            <p>
+              When a task establishes a reusable pattern, Newton writes a page here automatically —
+              or curate one by hand with <code>newton-wiki</code>. Pages become a retrieval source
+              the loop can draw on.
+            </p>
           </div>
         </div>
       ) : (
@@ -151,10 +156,14 @@ export function SkillsPanel() {
       )}
       {files.length === 0 && !adding ? (
         <div className="panelbody">
-          <div className="pempty">
-            No skills yet. Add one with <b>+ Add skill</b> above (or <code>newton-skill add &lt;name&gt;</code>) —
-            Newton loads the most relevant one into its plan for a matching task, and writes its own
-            when a task teaches it a reusable procedure.
+          <div className="emptystate">
+            <div className="esmark"><Icon name="zap" size={24} /></div>
+            <h3>No skills yet</h3>
+            <p>
+              Add a procedure playbook with <b>+ Add skill</b> above (or <code>newton-skill add</code>).
+              Newton loads the most relevant one into its plan for a matching task — and writes its own
+              when a task teaches it a reusable procedure.
+            </p>
           </div>
         </div>
       ) : (
@@ -227,26 +236,36 @@ function SkillForm({ onDone }: { onDone: (file?: string) => void }) {
   );
 }
 
-/** What Newton remembers — completed tasks recorded to .newton/memory.jsonl. */
+/** What Newton remembers — completed tasks recorded to memory so it can recall the right context. */
 export function MemoryPanel() {
   const [entries, setEntries] = useState<any[]>([]);
   useEffect(() => {
     fetchMemory().then(setEntries);
   }, []);
+
   return (
     <div className="panel">
       <div className="panelhead">
         <Icon name="database" size={17} />
         <h2>Memory</h2>
-        <span className="psub">{entries.length} remembered task{entries.length === 1 ? "" : "s"}</span>
+        <span className="psub">
+          {entries.length} remembered task{entries.length === 1 ? "" : "s"}
+        </span>
       </div>
       <div className="panelbody">
         {entries.length === 0 && (
-          <div className="pempty">No remembered tasks yet. Completed tasks are recorded here so Newton can recall them.</div>
+          <div className="emptystate">
+            <div className="esmark"><Icon name="database" size={24} /></div>
+            <h3>No memories yet</h3>
+            <p>
+              As Newton completes tasks it records what it learned here — with provenance trust and
+              time-decay — so it can recall the right context next time.
+            </p>
+          </div>
         )}
         {entries.map((e, i) => (
           <div className="memcard" key={i}>
-            <div className="memreq">{e.request}</div>
+            <div className="memreq">{e.request ?? e.text}</div>
             {e.files?.length ? (
               <div className="memmeta">
                 <Icon name="file" size={12} /> {e.files.join(", ")}
@@ -259,6 +278,20 @@ export function MemoryPanel() {
   );
 }
 
+/** Pick a fitting icon for a component from its name. */
+function compIcon(name: string): string {
+  const n = name.toLowerCase();
+  if (n.includes("project") && n.includes("conductor")) return "box";
+  if (n.includes("conductor")) return "terminal";
+  if (n.includes("context") || n.includes("rank")) return "search";
+  if (n.includes("memory")) return "database";
+  if (n.includes("wiki")) return "book";
+  if (n.includes("report")) return "file";
+  if (n.includes("intake") || n.includes("document")) return "paperclip";
+  if (n.includes("author")) return "pencil";
+  return "layers";
+}
+
 /** The component roadmap and what's built. */
 export function ComponentsPanel() {
   const [comps, setComps] = useState<Component[]>([]);
@@ -269,7 +302,7 @@ export function ComponentsPanel() {
   return (
     <div className="panel">
       <div className="panelhead">
-        <Icon name="box" size={17} />
+        <Icon name="box" size={19} />
         <h2>Components</h2>
         <span className="psub">{done} of {comps.length} built</span>
       </div>
@@ -277,12 +310,15 @@ export function ComponentsPanel() {
         {comps.map((c, i) => (
           <div className={`compcard ${c.status}`} key={i}>
             <div className="ctop">
+              <span className={`compicon ${c.status === "done" ? "ok" : ""}`}>
+                <Icon name={compIcon(c.name)} size={16} />
+              </span>
               <span className="cname">{c.name}</span>
               <span className={`cstatus ${c.status}`}>
-                <Icon name={c.status === "done" ? "check" : "settings"} size={12} /> {c.status}
+                <Icon name={c.status === "done" ? "check" : "settings"} size={11} /> {c.status}
               </span>
             </div>
-            <div className="cdesc">{c.desc}</div>
+            <p className="cdesc">{c.desc}</p>
           </div>
         ))}
       </div>

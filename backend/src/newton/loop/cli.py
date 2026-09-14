@@ -11,7 +11,9 @@ import argparse
 import sys
 
 from ..config import load_settings
-from .bestofn import BestOfN, best_of_default
+from .bestofn import BestOfN
+from .effort import ORDER, effort
+from .keepawake import keep_awake
 from .state import DONE, FAILED
 
 
@@ -58,9 +60,17 @@ def main(argv=None) -> int:
     ap.add_argument("--project", "-C", default=".", help="project directory (default: current)")
     ap.add_argument("--model", default=None, help="override the model (e.g. ollama:qwen2.5-coder:32b)")
     ap.add_argument("--resume", action="store_true", help="resume the last interrupted build")
-    ap.add_argument("--best-of", type=int, default=best_of_default(), metavar="N",
+    ap.add_argument("--effort", choices=ORDER, default=None,
+                    help="how much free local compute to spend for quality: quick | normal | "
+                         "thorough | max. Higher = more attempts, wider retrieval, more replans, and "
+                         "more verified whole-build attempts. Default: $NEWTON_EFFORT or normal.")
+    ap.add_argument("--best-of", type=int, default=None, metavar="N",
                     help="run the whole build N times in isolated copies and keep the attempt that "
-                         "verifies (default 1 = a single in-place build)")
+                         "verifies. Overrides the effort level's default (quick/normal=1, "
+                         "thorough=3, max=5).")
+    ap.add_argument("--keep-awake", action="store_true",
+                    help="stop the machine sleeping while the build runs, so a long unattended run "
+                         "finishes instead of freezing (Windows; no-op elsewhere).")
     args = ap.parse_args(argv)
 
     if not args.goal and not args.resume:
@@ -70,12 +80,14 @@ def main(argv=None) -> int:
     if args.model:
         settings.agent_model = args.model
 
-    bo = max(1, args.best_of)
+    eff = effort(args.effort)
+    bo = max(1, args.best_of) if args.best_of is not None else eff.best_of_n
     print(f"\033[1mNewton\033[0m · {settings.project_root}  ·  model: {settings.agent_model}"
-          + (f"  ·  best-of-{bo}" if bo > 1 else ""))
+          f"  ·  effort: {eff.name}" + (f"  ·  best-of-{bo}" if bo > 1 else ""))
     print("(builds run autonomously and modify project files; every step is checkpointed)")
 
-    result = BestOfN(settings, bo, emit=_make_emitter()).run(args.goal, resume=args.resume)
+    with keep_awake(args.keep_awake, notify=lambda m: print(f"  · {m}", flush=True)):
+        result = BestOfN(settings, bo, emit=_make_emitter(), effort=eff).run(args.goal, resume=args.resume)
 
     print(f"\n\033[1m{'Done' if result.ok else 'Incomplete'}\033[0m — {result.answer}")
     if not result.ok:

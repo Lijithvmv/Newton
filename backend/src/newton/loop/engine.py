@@ -27,16 +27,17 @@ from ..context import project_tree
 from ..index.graph import _module_of
 from ..tools import ToolBelt
 from .decompose import decompose
+from .effort import Effort
+from .effort import effort as _resolve_effort
 from .execute import NativeStepExecutor, StepExecutor, StepResult
 from .state import BLOCKED, DONE, FAILED, PENDING, RUN, RUNNING, WRITE, LoopState, Step
 
-MAX_ATTEMPTS = 3
-# How many times a failing check (RUN step) may drive a code fix + re-check. Bounded so a genuinely
-# unsolvable task can't loop forever; free local compute makes each extra cycle cheap.
-REPAIR_CYCLES = 2
-# How many times the loop may RE-DECOMPOSE when the plan itself is wrong (a step failed/blocked that
-# fixing a single file can't resolve) — the "Replan" of Plan→Execute→Verify→Replan.
-REPLAN_CYCLES = 2
+# The historical caps, kept as the definition of the `normal` effort level (see loop/effort.py).
+# They are no longer read directly — the LoopEngine takes its budgets from `self.effort`, so the SAME
+# model can be pushed harder (thorough/max) or lighter (quick) without editing the control flow.
+MAX_ATTEMPTS = 3        # per-step best-of-N by temperature
+REPAIR_CYCLES = 2       # failing-check → code-fix cycles (bounded so an unsolvable task can't loop forever)
+REPLAN_CYCLES = 2       # whole-plan re-decompositions (the "Replan" of Plan→Execute→Verify→Replan)
 
 # Third-party packages a generated file may import that aren't installed in Newton's venv — a
 # missing one is an environment gap (deferred to a real run), NOT a code bug to retry on. A missing
@@ -211,15 +212,24 @@ class LoopEngine:
     def __init__(self, settings: Settings, *, executor: StepExecutor | None = None,
                  shaper: ContextShaper | None = None,
                  emit: Callable[[str, Any], None] | None = None,
+                 effort: Effort | None = None,
                  checkpoint: str = "loop.json") -> None:
         self.s = settings
         self.root = Path(settings.project_root)
         self.emit = emit or (lambda *a: None)
+        # How much free local compute this run may spend to reach verified quality. `normal` == the
+        # historical constants, so the default is a no-op; higher levels push the SAME model harder
+        # (more attempts / wider retrieval / more replans), the lever that only free-token, unlimited-
+        # time local execution can pull. See loop/effort.py.
+        self.effort = effort or _resolve_effort()
         self.executor = executor or NativeStepExecutor(self.root, settings.agent_model)
         # Retrieval is the product-correct default: the context-engine always pulls the relevant
         # existing files into each step's window (essential on large repos; harmless on small ones),
-        # with compaction wired so a long, many-step run stays inside the window.
-        self.shaper = shaper or RetrievalShaper(self.root, summarize=self._make_summarizer())
+        # with compaction wired so a long, many-step run stays inside the window. Its width scales
+        # with effort — more compute buys a wider window and more retrieved files.
+        self.shaper = shaper or RetrievalShaper(
+            self.root, budget_chars=self.effort.budget_chars, k=self.effort.retrieval_k,
+            summarize=self._make_summarizer())
         self.checkpoint_path = self.root / ".newton" / checkpoint
         self._pending_error: dict[str, str] = {}      # step id → error to inject into its next context
         self._extra_temp: dict[str, float] = {}       # step id → added temperature (rises each repair)
@@ -264,7 +274,7 @@ class LoopEngine:
         # failure back to fix the CODE it exercises and re-run the check. Free compute + unlimited
         # time on local hardware make this iteration the way to lift a weak model's logic quality —
         # it turns "tests failed, give up" into "tests failed, fix the code, try again".
-        for _ in range(REPAIR_CYCLES):
+        for _ in range(self.effort.repair_cycles):
             if not self._repair_from_test_failure(state):
                 break
             self._drive(state)
@@ -272,11 +282,11 @@ class LoopEngine:
         # Replanning: if the loop is still stuck (a step failed/blocked that fixing one file didn't
         # resolve), the PLAN itself was wrong — re-decompose the remaining work given what exists and
         # what went wrong, and drive the new plan (+ its own repair cycles).
-        for gen in range(1, REPLAN_CYCLES + 1):
+        for gen in range(1, self.effort.replan_cycles + 1):
             if state.all_done() or not self._replan(state, goal, gen):
                 break
             self._drive(state)
-            for _ in range(REPAIR_CYCLES):
+            for _ in range(self.effort.repair_cycles):
                 if not self._repair_from_test_failure(state):
                     break
                 self._drive(state)
@@ -321,7 +331,7 @@ class LoopEngine:
 
         error: str | None = self._pending_error.pop(step.id, None)
         res = StepResult(False, "")
-        for attempt in range(MAX_ATTEMPTS):
+        for attempt in range(self.effort.max_attempts):
             step.attempts += 1
             # Best-of-N: each attempt samples a genuinely different candidate (temperature rises)
             # so the loop EXPLORES instead of repeating the same broken solution; the verify (and
@@ -342,7 +352,7 @@ class LoopEngine:
             error = res.detail
 
         step.status = DONE if res.ok else FAILED
-        step.result = res.detail[:200]
+        step.result = res.detail[:400]      # keep enough of a test failure for the repair to be targeted
         with self._state_lock:
             state.log.append(f"{step.id} {step.status}: {step.result}")
             state.save(self.checkpoint_path)          # checkpoint after EVERY step → resumable
@@ -372,8 +382,13 @@ class LoopEngine:
             if culprit is None:
                 return False
             self.emit("note", f"A check failed — fixing {culprit.file or culprit.id} and re-running it.")
-            self._pending_error[culprit.id] = (
-                f"A later check failed with this error — fix the code so it passes:\n{failed.result}")
+            msg = f"A later check failed with this error — fix the code so it passes:\n{failed.result}"
+            blast = self._blast_radius(culprit.file) if culprit.file else ""
+            if blast:
+                self.emit("note", f"Fixing {culprit.file} — {blast.count(chr(10))} file(s) depend on it; "
+                                  f"keeping their interface.")
+                msg += "\n\n" + blast
+            self._pending_error[culprit.id] = msg
         culprit.status = PENDING
         culprit.result = ""
         # Each repair explores a MORE different fix (best-of-N over cycles), not the same broken one.
@@ -394,10 +409,16 @@ class LoopEngine:
         return None
 
     def _culprit_step(self, error: str, state: LoopState) -> Step | None:
-        """The code (WRITE .py) step whose file the error names — the file to fix. Prefers a
-        non-test code file (the bug is in the code, not usually the test)."""
+        """The code (WRITE .py) step to fix for a failing check. Prefers a non-test production file the
+        error names directly. But a BEHAVIOURAL assertion (`assert x.transfer(...)` / `DID NOT RAISE`)
+        names only the TEST file in its traceback, even though the bug is in the production code the
+        test imports. In that case, route the fix to the production module the test imports — NOT the
+        test (the test is the spec; rewriting it just games the check and the loop stalls forever, as
+        the ledger diagnostic showed)."""
         code = {s.file.replace("\\", "/"): s for s in state.steps
                 if s.kind != RUN and s.file.endswith(".py")}
+        mod_to_step = {_module_of(p): s for p, s in code.items()}
+        named_tests: list[str] = []
         fallback = None
         for m in re.finditer(r"([\w./\\-]+\.py)", error or ""):
             tok = m.group(1).replace("\\", "/")
@@ -405,9 +426,103 @@ class LoopEngine:
             for path, step in code.items():
                 if path == tok or path.rsplit("/", 1)[-1] == base:
                     if not base.startswith("test_"):
-                        return step
+                        return step                       # a production file is named — fix it
                     fallback = fallback or step
+            if base.startswith("test_"):
+                named_tests.append(tok)
+        # No production file named — map the failing test to the production module(s) it imports.
+        for t in named_tests:
+            for mod in self._imports_of_test(t):
+                if mod in mod_to_step:
+                    return mod_to_step[mod]
         return fallback
+
+    def _imports_of_test(self, test_rel: str) -> list[str]:
+        """Project modules a test file imports (`from service import Ledger` → 'service'), so a
+        behavioural failure can be routed to the code that implements the behaviour. Reads the file
+        from disk (the test may be a seeded fixture, not a planned step); best-effort."""
+        import ast
+        p = self.root / test_rel
+        if not p.is_file():
+            hits = list(self.root.rglob(test_rel.rsplit("/", 1)[-1]))
+            if not hits:
+                return []
+            p = hits[0]
+        try:
+            tree = ast.parse(p.read_text(encoding="utf-8", errors="ignore"))
+        except (OSError, SyntaxError):
+            return []
+        mods: list[str] = []
+        for n in ast.walk(tree):
+            if isinstance(n, ast.ImportFrom) and n.module and n.level == 0:
+                mods.append(n.module)
+            elif isinstance(n, ast.Import):
+                mods.extend(a.name for a in n.names)
+        return list(dict.fromkeys(mods))
+
+    def _code_graph(self):
+        """A fresh import/def graph over the project's Python files — cheap to rebuild (repairs are
+        rare and a build's tree is small) and independent of the shaper, so blast-radius works whatever
+        context strategy is in use."""
+        from ..index.graph import CodeGraph, analyze_python
+        skip = {".venv", "venv", "node_modules", "__pycache__", ".git", ".newton", "vendor"}
+        g = CodeGraph()
+        for py in self.root.rglob("*.py"):
+            if any(p in skip for p in py.parts):
+                continue
+            rel = py.relative_to(self.root).as_posix()
+            try:
+                g.add(analyze_python(rel, py.read_text(encoding="utf-8", errors="ignore")))
+            except OSError:
+                continue
+        g.finalize()
+        return g
+
+    def _imported_names_from(self, dep_rel: str, target_mod: str) -> list[str]:
+        """The names `dep_rel` imports FROM module `target_mod` (`from service import Ledger` → ['Ledger'])
+        — the exact interface a fix to the target must not break."""
+        import ast
+
+        from ..index.graph import CodeGraph
+        try:
+            tree = ast.parse((self.root / dep_rel).read_text(encoding="utf-8", errors="ignore"))
+        except (OSError, SyntaxError):
+            return []
+        importer_mod = _module_of(dep_rel.replace("\\", "/"))
+        names: list[str] = []
+        for n in ast.walk(tree):
+            if isinstance(n, ast.ImportFrom):
+                resolved = CodeGraph._resolve(importer_mod, "." * n.level + (n.module or ""))
+                if resolved == target_mod or resolved.startswith(target_mod + "."):
+                    names.extend(a.name for a in n.names)
+            elif isinstance(n, ast.Import):
+                for a in n.names:
+                    if a.name == target_mod:
+                        names.append(a.name.rsplit(".", 1)[-1])
+        return list(dict.fromkeys(names))
+
+    def _blast_radius(self, rel: str) -> str:
+        """The PRODUCTION files that depend on `rel` (import its module), and the names they use from
+        it — surfaced into a repair so a fix to a shared file keeps its callers working instead of
+        silently breaking them (the D63 cross-file-consistency failure). Empty when nothing depends on
+        it. Test files are excluded: the point is protecting OTHER code, and the failing test's own
+        interface is already carried by the error message."""
+        rel = rel.replace("\\", "/")
+        try:
+            deps = [d for d in self._code_graph().dependents(rel)
+                    if not d.rsplit("/", 1)[-1].startswith("test_")]
+        except Exception:
+            return ""
+        if not deps:
+            return ""
+        target_mod = _module_of(rel)
+        lines = []
+        for dep in deps[:6]:                              # cap so the small window isn't flooded
+            syms = self._imported_names_from(dep, target_mod)
+            lines.append(f"  - {dep}" + (f" (uses: {', '.join(syms)})" if syms else ""))
+        return (f"Blast radius — these files import `{target_mod}` (in {rel}). Your fix MUST keep the "
+                f"names they rely on working (do not rename or remove them; change only the "
+                f"implementation):\n" + "\n".join(lines))
 
     def _ensure_verification(self, state: LoopState, goal: str) -> None:
         """If the plan produced code but NO check, generate a goal-grounded test and run it — so a
@@ -470,7 +585,7 @@ class LoopEngine:
         self.emit("plan", [{"id": step.id, "goal": step.goal, "kind": step.kind,
                             "file": step.file, "depends_on": step.depends_on}])
         self._run_step(step, state)
-        for _ in range(REPAIR_CYCLES):                   # a load failure fixes the file it blames
+        for _ in range(self.effort.repair_cycles):       # a load failure fixes the file it blames
             if not self._repair_from_test_failure(state):
                 break
             self._drive(state)

@@ -80,12 +80,6 @@ newton-index . --query "..."  # inspect the repo index (search / --defs / --deps
 .venv/Scripts/python -m pytest backend/tests -q
 ```
 
-## How the thinking is tracked
-
-Newton keeps its own engineer's notebook under [`mission-control/`](mission-control/) — the
-north-star, architecture, decisions, and progress. It's how the project stays coherent across
-sessions, and doubles as a readable record of *why* it's built the way it is.
-
 ## License
 
 [MIT](LICENSE) © Lijith V M

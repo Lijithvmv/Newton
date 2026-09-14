@@ -1,4 +1,30 @@
+import { useEffect, useState } from "react";
+import { fetchSavings, type Savings } from "../api";
 import type { Mode } from "../types";
+import { Icon } from "./icons";
+
+/** The cloud-cost-avoided meter — Newton's zero-token-cost edge, in dollars. Polls while open. */
+function SavingsChip() {
+  const [s, setS] = useState<Savings | null>(null);
+  useEffect(() => {
+    const load = () => fetchSavings().then(setS);
+    load();
+    const id = setInterval(load, 15000);
+    return () => clearInterval(id);
+  }, []);
+  if (!s || s.calls === 0) return null;
+  const dollars = s.saved_usd >= 0.01 ? `$${s.saved_usd.toFixed(2)}` : `$${s.saved_usd.toFixed(4)}`;
+  return (
+    <span
+      className="chip savings"
+      title={`${s.note}\nBaseline: ${s.baseline_model} · ${s.calls} local call${s.calls === 1 ? "" : "s"} · ` +
+        `${(s.input_tokens + s.output_tokens).toLocaleString()} tokens${s.estimated ? " (estimated)" : ""}`}
+    >
+      <Icon name="zap" size={13} />
+      <span className="mono">{s.estimated ? "≈ " : ""}{dollars} saved</span>
+    </span>
+  );
+}
 
 export function TopBar({
   mode,
@@ -43,6 +69,7 @@ export function TopBar({
         ))}
       </div>
       <div className="sp" />
+      <SavingsChip />
       <span className="chip">
         <span className="live" />{" "}
         <select className="mono modelsel" value={model ?? ""} onChange={(e) => setModel(e.target.value)}>

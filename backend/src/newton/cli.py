@@ -9,6 +9,7 @@ Usage:
     python -m newton "your task"     # one-shot
     python -m newton --project PATH  # point at another project root
     python -m newton --yes           # auto-approve mutations (careful)
+    python -m newton --savings       # show cloud cost avoided, then exit
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from __future__ import annotations
 import sys
 from typing import Any
 
+from . import savings
 from .agent import Agent
 from .config import load_settings
 
@@ -87,6 +89,9 @@ def _run_task(agent: Agent, task: str) -> None:
     print(BOLD(f"\n▸ {task}"))
     result = agent.run(task)
     print(GREEN(f"\n✓ ({result.turns} turns)\n") + result.answer + "\n")
+    s = savings.summary()
+    print(DIM(f"  ~${s['saved_usd']:.4f} cloud cost avoided so far · {s['calls']} calls · "
+              f"vs {s['baseline_model']}" + (" · estimated tokens" if s["estimated"] else "") + "\n"))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -94,6 +99,7 @@ def main(argv: list[str] | None = None) -> int:
 
     project = "."
     auto = False
+    show_savings = False
     task_parts: list[str] = []
     it = iter(argv)
     for arg in it:
@@ -101,6 +107,8 @@ def main(argv: list[str] | None = None) -> int:
             project = next(it, ".")
         elif arg in ("--yes", "-y"):
             auto = True
+        elif arg == "--savings":
+            show_savings = True
         elif arg in ("--help", "-h"):
             print(__doc__)
             return 0
@@ -108,6 +116,13 @@ def main(argv: list[str] | None = None) -> int:
             task_parts.append(arg)
 
     settings = load_settings(project)
+    savings.configure(settings.project_root)      # tally cloud-cost-avoided into <project>/.newton
+    if show_savings:
+        s = savings.summary()
+        print(BOLD(f"Cloud cost avoided: ~${s['saved_usd']:.4f}") + DIM(
+            f"  ({s['calls']} calls · {s['input_tokens']:,} in / {s['output_tokens']:,} out tokens · "
+            f"vs {s['baseline_model']}" + ("; estimated" if s["estimated"] else "") + ")"))
+        return 0
     agent = Agent(settings, approve=_make_approver(auto), emit=_emit)
 
     print(BOLD("Newton") + DIM(f" · {settings.agent_model} · {settings.project_root}"))

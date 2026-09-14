@@ -49,4 +49,8 @@ def complete(
         kwargs["options"] = {"num_ctx": _NUM_CTX, "temperature": temperature}
     if tools:
         kwargs["tools"] = tools
-    return _client.chat.completions.create(**kwargs)
+    resp = _client.chat.completions.create(**kwargs)
+    # Tally what this would have cost on the cloud (no-op until configured; never raises).
+    from . import savings
+    savings.record_response(resp, messages)
+    return resp

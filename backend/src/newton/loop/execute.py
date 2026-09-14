@@ -92,4 +92,23 @@ class NativeStepExecutor:
         if r.returncode == 5 and "pytest" in cmd.lower():
             return StepResult(False, f"NO_TESTS_COLLECTED (pytest exit 5): the test file defines no "
                                      f"`def test_*` functions, so pytest ran nothing. {out[:200]}")
-        return StepResult(False, f"command failed (exit {r.returncode}): {out[:300]}")
+        return StepResult(False, f"command failed (exit {r.returncode}): {_extract_failure(out)}")
+
+
+def _extract_failure(out: str, limit: int = 500) -> str:
+    """Pull the ACTIONABLE part of a failed test run for the repair loop.
+
+    A bare `pytest -q` failure starts with progress dots (`..F.`) and only names the failing test +
+    assertion at the END (`E   ...`, `FAILED file::test - message`). Truncating from the top fed the
+    repair those useless dots, so the model kept regenerating identical code. Instead, surface the
+    lines that say WHAT failed — the `FAILED ...` summary and the `E ...`/assert lines — so the model
+    gets a targeted signal (e.g. 'DID NOT RAISE ValueError'). Falls back to the tail, where pytest
+    prints its summary, when nothing matches."""
+    picked: list[str] = []
+    for ln in out.splitlines():
+        s = ln.strip()
+        if ln.startswith("FAILED ") or ln.startswith("ERROR ") or s.startswith("E ") \
+                or s.startswith("assert ") or s.endswith("Error") or ": error:" in s:
+            picked.append(s)
+    text = "\n".join(dict.fromkeys(picked)) if picked else out[-limit:]   # dedupe, keep order
+    return text[:limit]

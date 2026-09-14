@@ -16,6 +16,7 @@ import queue
 import shutil
 import tempfile
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,6 +29,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from .. import savings as _savings
 from ..author.conductor import AuthorConductor
 from ..chat.conductor import ChatConductor
 from ..conductor.pipeline import Conductor
@@ -43,6 +45,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[4]          # …/backend/src/newt
 FRONTEND_DIST = _REPO_ROOT / "frontend" / "dist"
 LEGACY_STATIC = Path(__file__).parent / "static"
 
+# Point the cloud-cost-avoided meter at this project so every LLM call is tallied.
+_savings.configure(_REPO_ROOT)
+
 
 @dataclass
 class Run:
@@ -51,6 +56,11 @@ class Run:
     gate: threading.Event = field(default_factory=threading.Event)
     decision: bool = False
     finished: bool = False
+    task: str = ""              # what was asked — for the activity feed
+    mode: str = ""              # chat | task | project | author | report
+    status: str = "running"     # running | done | failed
+    started: float = 0.0        # epoch seconds, for ordering the feed
+    ok: bool = False
 
 
 class RunManager:
@@ -58,16 +68,29 @@ class RunManager:
         self.runs: dict[str, Run] = {}
 
     def start(self, task: str, project: str, model: str | None, auto: bool, mode: str,
-              doc_type: str = "prd") -> str:
-        run = Run(id=uuid.uuid4().hex[:12])
+              doc_type: str = "prd", effort: str = "normal") -> str:
+        run = Run(id=uuid.uuid4().hex[:12], task=task, mode=mode, started=time.time())
         self.runs[run.id] = run
+        self._prune()
         t = threading.Thread(target=self._worker,
-                             args=(run, task, project, model, auto, mode, doc_type), daemon=True)
+                             args=(run, task, project, model, auto, mode, doc_type, effort), daemon=True)
         t.start()
         return run.id
 
+    def _prune(self, keep: int = 40) -> None:
+        """Cap in-memory run history: drop the oldest FINISHED runs beyond `keep` (never active ones)."""
+        if len(self.runs) <= keep:
+            return
+        finished = sorted((r for r in self.runs.values() if r.finished), key=lambda r: r.started)
+        for r in finished[: len(self.runs) - keep]:
+            self.runs.pop(r.id, None)
+
+    def recent(self, limit: int = 15) -> list[Run]:
+        """Recent runs, newest first — active ones plus lately-finished, for the activity feed."""
+        return sorted(self.runs.values(), key=lambda r: r.started, reverse=True)[:limit]
+
     def _worker(self, run: Run, task: str, project: str, model: str | None, auto: bool,
-                mode: str, doc_type: str = "prd") -> None:
+                mode: str, doc_type: str = "prd", effort: str = "normal") -> None:
         settings = load_settings(project)
         if model:
             settings.agent_model = model if model.startswith("ollama:") else f"ollama:{model}"
@@ -84,9 +107,11 @@ class RunManager:
             run.gate.wait()               # block the engine until the browser answers
             return run.decision
 
+        final_ok = False
         try:
             if mode == "chat":
                 ChatConductor(settings, emit=emit, approve=approve).run(task)
+                final_ok = True
                 run.events.put({"ch": "done", "payload": {"ok": True, "answer": "", "stages": []}})
             elif mode == "project":
                 # Build is now powered by the LoopEngine (the proven decomposition loop: retrieval,
@@ -94,6 +119,7 @@ class RunManager:
                 # events are translated to the backlog/task/project shapes the Build UI already
                 # renders, so no UI component changes are needed.
                 from ..loop import LoopEngine
+                from ..loop import effort as resolve_effort
 
                 def loop_emit(ch: str, p: Any) -> None:
                     if ch == "plan":
@@ -110,23 +136,29 @@ class RunManager:
                     else:
                         emit(ch, p)                 # stage, note, halt pass through unchanged
 
-                result = LoopEngine(settings, emit=loop_emit).run(task)
+                result = LoopEngine(settings, emit=loop_emit, effort=resolve_effort(effort)).run(task)
+                final_ok = result.ok
                 run.events.put({"ch": "done", "payload": {"ok": result.ok, "answer": result.answer, "stages": []}})
             elif mode == "report":
                 rep = ReportConductor(settings, emit=emit, approve=approve).run(task or "status")
                 answer = f"Report written to {rep.path}" if rep.ok else "Report not saved."
+                final_ok = rep.ok
                 run.events.put({"ch": "done", "payload": {"ok": rep.ok, "answer": answer, "stages": []}})
             elif mode == "author":
                 doc = AuthorConductor(settings, emit=emit, approve=approve).run(doc_type, task)
                 answer = f"Drafted {doc.path}" if doc.ok else "Document not saved."
+                final_ok = doc.ok
                 run.events.put({"ch": "done", "payload": {"ok": doc.ok, "answer": answer, "stages": []}})
             else:
                 result = Conductor(settings, emit=emit, approve=approve, auto_approve=auto).run(task)
+                final_ok = result.ok
                 run.events.put({"ch": "done", "payload": {
                     "ok": result.ok, "answer": result.answer, "stages": result.stages}})
         except Exception as e:  # never leave the stream hanging on an engine crash
             run.events.put({"ch": "done", "payload": {"ok": False, "answer": f"engine error: {e}", "stages": []}})
         finally:
+            run.ok = final_ok
+            run.status = "done" if final_ok else "failed"
             run.finished = True
 
     def resolve(self, run_id: str, decision: bool) -> bool:
@@ -157,6 +189,7 @@ class RunReq(BaseModel):
     auto: bool = False
     mode: str = "task"          # "task" | "project" | "report" | "author"
     doc_type: str = "prd"       # for mode="author": prd | architecture | brainstorm | design
+    effort: str = "normal"      # for mode="project" (Build): quick | normal | thorough | max
 
 
 class ApproveReq(BaseModel):
@@ -281,6 +314,20 @@ async def verify_memory(req: VerifyReq) -> dict:
     return {"ok": True, "verified": {"text": item.text, "origin": item.origin, "ts": item.ts}}
 
 
+@app.get("/api/savings")
+async def savings() -> dict:
+    """The cloud-cost-avoided meter: what Newton's local (free) inference would have cost on a cloud
+    API, priced against a static offline rate snapshot. Newton's zero-token-cost edge, in dollars."""
+    return _savings.summary()
+
+
+@app.get("/api/runs")
+async def runs() -> dict:
+    """Recent runs — active + lately-finished — for the Overview activity feed."""
+    return {"runs": [{"id": r.id, "task": r.task, "mode": r.mode, "status": r.status,
+                      "started": r.started, "ok": r.ok} for r in manager.recent()]}
+
+
 @app.get("/api/components")
 async def components() -> dict:
     return {"components": [
@@ -354,7 +401,7 @@ async def browse(path: str = "") -> dict:
 
 @app.post("/api/run")
 async def run(req: RunReq) -> dict:
-    run_id = manager.start(req.task, req.project, req.model, req.auto, req.mode, req.doc_type)
+    run_id = manager.start(req.task, req.project, req.model, req.auto, req.mode, req.doc_type, req.effort)
     return {"run_id": run_id}
 
 

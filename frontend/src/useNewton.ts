@@ -4,6 +4,7 @@ import type {
   BacklogTask,
   ContextPayload,
   DocType,
+  EffortLevel,
   GatePayload,
   Mode,
   TaskStatus,
@@ -150,7 +151,8 @@ export function useNewton() {
   }, []);
 
   const run = useCallback(
-    async (task: string, project: string, auto: boolean, mode: Mode, docType?: DocType) => {
+    async (task: string, project: string, auto: boolean, mode: Mode, docType?: DocType,
+           effort?: EffortLevel) => {
       projectShown.current = false;
       answered.current = false;
       setState((s) => ({
@@ -162,7 +164,7 @@ export function useNewton() {
         gate: null,
         running: true,
       }));
-      const id = await startRun({ task, project, model, auto, mode, doc_type: docType });
+      const id = await startRun({ task, project, model, auto, mode, doc_type: docType, effort });
       runId.current = id;
       const source = openEvents(id);
       es.current = source;

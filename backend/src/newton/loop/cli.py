@@ -38,6 +38,11 @@ def _make_emitter():
                 print("  \033[32m✓ done\033[0m", flush=True)
             elif p.get("status") == FAILED:
                 print(f"  \033[31m✗ failed:\033[0m {str(p.get('detail',''))[:120]}", flush=True)
+        elif ch == "verdict":
+            colour = {"pass": "\033[32m✓ PASS\033[0m",
+                      "attention": "\033[33m⚠ NEEDS ATTENTION\033[0m",
+                      "block": "\033[31m✗ WOULD BLOCK\033[0m"}.get(p.get("level"), p.get("label", ""))
+            print(f"\nReview: {colour} — {p.get('reason', '')}", flush=True)
         elif ch == "halt":
             print(f"\n\033[31mStopped:\033[0m {p}", flush=True)
     return emit

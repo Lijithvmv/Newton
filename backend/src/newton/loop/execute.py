@@ -19,6 +19,7 @@ from typing import Protocol
 
 from ..conductor.state import extract_code
 from ..llm import complete
+from .output_check import error_shaped
 from .state import RUN, Step
 
 STEP_SYSTEM = (
@@ -85,6 +86,13 @@ class NativeStepExecutor:
             return StepResult(False, f"command timed out: {step.command}")
         out = ((r.stdout or "") + (r.stderr or "")).strip()
         if r.returncode == 0:
+            # A command can exit 0 and still have failed (a wrapper swallows the code, a script prints
+            # a traceback but returns 0, a server returns an error page). This cheap verifier — from
+            # toolgrad's output validator — catches the unambiguous cases; it's conservative so a valid
+            # exit-0 command is never failed by mistake.
+            if error_shaped(out):
+                return StepResult(False, f"command exited 0 but its output looks like a failure: "
+                                         f"{_extract_failure(out)}")
             return StepResult(True, f"command ok: {out[:160]}")
         # pytest exit 5 = "no tests collected" — NOT a test failure and NOT a code bug: the test file
         # has no `def test_*` functions (a weak model often writes bare module-level asserts). Flag it

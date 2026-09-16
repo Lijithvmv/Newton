@@ -222,7 +222,12 @@ class RepoIndex:
     def _semantic_rerank(self, query: str, candidates: list[tuple[int, float]]):
         """Blend normalized BM25 with cosine of query↔chunk embeddings. Chunk vectors come
         from the content-hashed cache; only cache-miss chunks are embedded (and persisted), so
-        unchanged code is never re-embedded. Returns None (→ pure BM25) on any failure."""
+        unchanged code is never re-embedded. Returns None (→ pure BM25) on any failure.
+
+        (Evaluated uteke's Reciprocal Rank Fusion here 2026-09-15 and reverted it: RRF fuses by rank
+        and discards magnitude, so on the SMALL candidate pools Newton retrieves over it cannot let a
+        decisive semantic win break a near-tie on BM25 — the very case this re-rank exists for. RRF
+        helps a large memory corpus; weighted-score blend is measurably better for code retrieval.)"""
         from .embeddings import cosine
 
         try:

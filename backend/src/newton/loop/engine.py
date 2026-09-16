@@ -501,6 +501,16 @@ class LoopEngine:
                         names.append(a.name.rsplit(".", 1)[-1])
         return list(dict.fromkeys(names))
 
+    def _dependents(self, rel: str) -> list[str]:
+        """PRODUCTION files that import `rel`'s module (test files excluded) — the blast radius.
+        Best-effort: an empty list on any graph failure."""
+        rel = rel.replace("\\", "/")
+        try:
+            return [d for d in self._code_graph().dependents(rel)
+                    if not d.rsplit("/", 1)[-1].startswith("test_")]
+        except Exception:
+            return []
+
     def _blast_radius(self, rel: str) -> str:
         """The PRODUCTION files that depend on `rel` (import its module), and the names they use from
         it — surfaced into a repair so a fix to a shared file keeps its callers working instead of
@@ -508,11 +518,7 @@ class LoopEngine:
         it. Test files are excluded: the point is protecting OTHER code, and the failing test's own
         interface is already carried by the error message."""
         rel = rel.replace("\\", "/")
-        try:
-            deps = [d for d in self._code_graph().dependents(rel)
-                    if not d.rsplit("/", 1)[-1].startswith("test_")]
-        except Exception:
-            return ""
+        deps = self._dependents(rel)
         if not deps:
             return ""
         target_mod = _module_of(rel)
@@ -672,6 +678,28 @@ class LoopEngine:
                             "depends_on": s.depends_on} for s in new_steps])
         return True
 
+    def _run_verdict(self, state: LoopState):
+        """A graduated, advisory verdict for the finished build (PASS / NEEDS ATTENTION / WOULD BLOCK),
+        composed from Newton's own signals — did every step verify, and do other files depend on the
+        changed ones (blast radius). Advisory only: it never changes the loop's behaviour. Builds the
+        code graph once and queries it, so it's cheap at finalize time."""
+        from .verdict import review_run
+        failed = sum(1 for s in state.steps if s.status in (FAILED, BLOCKED))
+        fwd: list[tuple[str, list[str]]] = []
+        try:
+            graph = self._code_graph()
+        except Exception:
+            graph = None
+        if graph is not None:
+            for s in state.steps:
+                base = s.file.replace("\\", "/").rsplit("/", 1)[-1]
+                if s.status == DONE and s.kind != RUN and s.file.endswith(".py") and not base.startswith("test_"):
+                    deps = [d for d in graph.dependents(s.file.replace("\\", "/"))
+                            if not d.rsplit("/", 1)[-1].startswith("test_")]
+                    if deps:
+                        fwd.append((s.file, deps))
+        return review_run(failed, fwd)
+
     def _finalize(self, state: LoopState) -> LoopResult:
         for s in state.steps:                          # anything left had a failed/blocked dependency
             if s.status in (PENDING, RUNNING):
@@ -679,8 +707,11 @@ class LoopEngine:
         state.save(self.checkpoint_path)
         c = state.counts()
         ok = state.all_done()
-        answer = (f"{c[DONE]} done, {c[FAILED]} failed, {c[BLOCKED]} blocked "
+        counts = (f"{c[DONE]} done, {c[FAILED]} failed, {c[BLOCKED]} blocked "
                   f"of {len(state.steps)} steps.")
+        vd = self._run_verdict(state)
+        self.emit("verdict", {"level": vd.level, "label": vd.label, "reason": vd.reason})
+        answer = f"[{vd.label}] {counts} — {vd.reason}"
         self.emit("loop", {"ok": ok, "answer": answer, "counts": c})
         return LoopResult(ok, answer, state)
 

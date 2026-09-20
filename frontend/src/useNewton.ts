@@ -6,6 +6,7 @@ import type {
   DocType,
   EffortLevel,
   GatePayload,
+  LoopBudget,
   Mode,
   TaskStatus,
   ThreadItem,
@@ -26,6 +27,7 @@ export interface NewtonState {
   taskStatus: Record<string, TaskStatus>;
   gate: { kind: string; path?: string } | null;
   running: boolean;
+  budget: LoopBudget | null;
 }
 
 const empty: NewtonState = {
@@ -36,6 +38,7 @@ const empty: NewtonState = {
   taskStatus: {},
   gate: null,
   running: false,
+  budget: null,
 };
 
 export function useNewton() {
@@ -137,6 +140,12 @@ export function useNewton() {
         answered.current = true;
         push({ kind: "answer", text: p as string });
         break;
+      case "evidence":
+        push({ kind: "evidence", evidence: p as any });
+        break;
+      case "budget":
+        setState((s) => ({ ...s, budget: p as LoopBudget }));
+        break;
       case "project":
         projectShown.current = true;
         push({ kind: "final", ok: p.ok, text: p.answer });
@@ -152,19 +161,20 @@ export function useNewton() {
 
   const run = useCallback(
     async (task: string, project: string, auto: boolean, mode: Mode, docType?: DocType,
-           effort?: EffortLevel) => {
+           effort?: EffortLevel, resume?: boolean) => {
       projectShown.current = false;
       answered.current = false;
       setState((s) => ({
         ...s,
-        thread: [{ kind: "user", text: task }],
+        thread: [{ kind: "user", text: resume ? `Resuming: ${task}` : task }],
         stages: { current: null, done: [] },
         context: null,
         taskStatus: {},
         gate: null,
         running: true,
+        budget: null,
       }));
-      const id = await startRun({ task, project, model, auto, mode, doc_type: docType, effort });
+      const id = await startRun({ task, project, model, auto, mode, doc_type: docType, effort, resume });
       runId.current = id;
       const source = openEvents(id);
       es.current = source;

@@ -36,6 +36,7 @@ from ..conductor.pipeline import Conductor
 from ..config import load_settings
 from ..intake.converter import IntakeError, ingest
 from ..report.conductor import ReportConductor
+from ..runlog import RunLog
 
 OLLAMA = "http://localhost:11434"
 
@@ -47,6 +48,23 @@ LEGACY_STATIC = Path(__file__).parent / "static"
 
 # Point the cloud-cost-avoided meter at this project so every LLM call is tallied.
 _savings.configure(_REPO_ROOT)
+
+# Durable run history — survives a server restart, so the Overview feed and History view show real
+# past runs and an interrupted Build can be resumed. Runtime state under .newton/ (gitignored).
+_runlog = RunLog(_REPO_ROOT / ".newton" / "runs.json")
+
+
+def _build_resumable(project: str) -> bool:
+    """Can an interrupted Build in `project` be resumed? True when its loop checkpoint exists and the
+    plan isn't fully done — i.e. there is unfinished work to continue from. Best-effort/never raises."""
+    try:
+        from ..loop.state import LoopState
+        cp = Path(load_settings(project).project_root) / ".newton" / "loop.json"
+        if not cp.is_file():
+            return False
+        return not LoopState.load(cp).all_done()
+    except Exception:
+        return False
 
 
 @dataclass
@@ -61,6 +79,9 @@ class Run:
     status: str = "running"     # running | done | failed
     started: float = 0.0        # epoch seconds, for ordering the feed
     ok: bool = False
+    project: str = "."          # which project it ran in — needed to resume a Build
+    effort: str = "normal"      # Build effort level — persisted so a resume re-issues faithfully
+    model: str | None = None    # model used — persisted for a faithful resume
 
 
 class RunManager:
@@ -68,12 +89,17 @@ class RunManager:
         self.runs: dict[str, Run] = {}
 
     def start(self, task: str, project: str, model: str | None, auto: bool, mode: str,
-              doc_type: str = "prd", effort: str = "normal") -> str:
-        run = Run(id=uuid.uuid4().hex[:12], task=task, mode=mode, started=time.time())
+              doc_type: str = "prd", effort: str = "normal", resume: bool = False) -> str:
+        run = Run(id=uuid.uuid4().hex[:12], task=task, mode=mode, started=time.time(),
+                  project=project, effort=effort, model=model)
         self.runs[run.id] = run
         self._prune()
+        _runlog.add({"id": run.id, "task": task, "mode": mode, "status": "running",
+                     "started": run.started, "ok": False, "project": project, "effort": effort,
+                     "model": model, "resumable": False, "answer": ""})
         t = threading.Thread(target=self._worker,
-                             args=(run, task, project, model, auto, mode, doc_type, effort), daemon=True)
+                             args=(run, task, project, model, auto, mode, doc_type, effort, resume),
+                             daemon=True)
         t.start()
         return run.id
 
@@ -90,10 +116,12 @@ class RunManager:
         return sorted(self.runs.values(), key=lambda r: r.started, reverse=True)[:limit]
 
     def _worker(self, run: Run, task: str, project: str, model: str | None, auto: bool,
-                mode: str, doc_type: str = "prd", effort: str = "normal") -> None:
+                mode: str, doc_type: str = "prd", effort: str = "normal", resume: bool = False) -> None:
         settings = load_settings(project)
         if model:
             settings.agent_model = model if model.startswith("ollama:") else f"ollama:{model}"
+        final_answer = ""
+        evidence_summary: dict | None = None
 
         def emit(channel: str, payload: Any) -> None:
             run.events.put({"ch": channel, "payload": payload})
@@ -136,30 +164,40 @@ class RunManager:
                     else:
                         emit(ch, p)                 # stage, note, halt pass through unchanged
 
-                result = LoopEngine(settings, emit=loop_emit, effort=resolve_effort(effort)).run(task)
+                result = LoopEngine(settings, emit=loop_emit,
+                                    effort=resolve_effort(effort)).run(task, resume=resume)
                 final_ok = result.ok
+                final_answer = result.answer
+                if result.evidence is not None:
+                    evidence_summary = result.evidence.summary()
                 run.events.put({"ch": "done", "payload": {"ok": result.ok, "answer": result.answer, "stages": []}})
             elif mode == "report":
                 rep = ReportConductor(settings, emit=emit, approve=approve).run(task or "status")
                 answer = f"Report written to {rep.path}" if rep.ok else "Report not saved."
-                final_ok = rep.ok
+                final_ok, final_answer = rep.ok, answer
                 run.events.put({"ch": "done", "payload": {"ok": rep.ok, "answer": answer, "stages": []}})
             elif mode == "author":
                 doc = AuthorConductor(settings, emit=emit, approve=approve).run(doc_type, task)
                 answer = f"Drafted {doc.path}" if doc.ok else "Document not saved."
-                final_ok = doc.ok
+                final_ok, final_answer = doc.ok, answer
                 run.events.put({"ch": "done", "payload": {"ok": doc.ok, "answer": answer, "stages": []}})
             else:
                 result = Conductor(settings, emit=emit, approve=approve, auto_approve=auto).run(task)
-                final_ok = result.ok
+                final_ok, final_answer = result.ok, result.answer
                 run.events.put({"ch": "done", "payload": {
                     "ok": result.ok, "answer": result.answer, "stages": result.stages}})
         except Exception as e:  # never leave the stream hanging on an engine crash
-            run.events.put({"ch": "done", "payload": {"ok": False, "answer": f"engine error: {e}", "stages": []}})
+            final_answer = f"engine error: {e}"
+            run.events.put({"ch": "done", "payload": {"ok": False, "answer": final_answer, "stages": []}})
         finally:
             run.ok = final_ok
             run.status = "done" if final_ok else "failed"
             run.finished = True
+            # Persist the outcome so history survives a restart; a not-ok Build with unfinished
+            # checkpoint steps is marked resumable so the UI can offer to continue it.
+            _runlog.update(run.id, status=run.status, ok=final_ok, finished=time.time(),
+                           answer=final_answer[:500], evidence=evidence_summary,
+                           resumable=(mode == "project" and not final_ok and _build_resumable(project)))
 
     def resolve(self, run_id: str, decision: bool) -> bool:
         run = self.runs.get(run_id)
@@ -190,6 +228,7 @@ class RunReq(BaseModel):
     mode: str = "task"          # "task" | "project" | "report" | "author"
     doc_type: str = "prd"       # for mode="author": prd | architecture | brainstorm | design
     effort: str = "normal"      # for mode="project" (Build): quick | normal | thorough | max
+    resume: bool = False        # for mode="project": continue this project's checkpointed Build
 
 
 class ApproveReq(BaseModel):
@@ -322,10 +361,10 @@ async def savings() -> dict:
 
 
 @app.get("/api/runs")
-async def runs() -> dict:
-    """Recent runs — active + lately-finished — for the Overview activity feed."""
-    return {"runs": [{"id": r.id, "task": r.task, "mode": r.mode, "status": r.status,
-                      "started": r.started, "ok": r.ok} for r in manager.recent()]}
+async def runs(limit: int = 50) -> dict:
+    """Recent runs — newest first — for the Overview activity feed and the History view. Served from
+    the durable log so history survives a server restart; a resumable Build carries `resumable: true`."""
+    return {"runs": _runlog.recent(limit)}
 
 
 @app.get("/api/components")
@@ -401,7 +440,8 @@ async def browse(path: str = "") -> dict:
 
 @app.post("/api/run")
 async def run(req: RunReq) -> dict:
-    run_id = manager.start(req.task, req.project, req.model, req.auto, req.mode, req.doc_type, req.effort)
+    run_id = manager.start(req.task, req.project, req.model, req.auto, req.mode, req.doc_type,
+                           req.effort, req.resume)
     return {"run_id": run_id}
 
 
@@ -460,8 +500,28 @@ if (FRONTEND_DIST / "assets").is_dir():
 
 
 def main() -> None:
+    """Launch the local Newton app: `newton-server [--open] [--port N]`. Serves the built React UI
+    and the API from one process — the one-command way to run Newton after `npm run build`."""
+    import argparse
+
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8770, log_level="warning")
+
+    ap = argparse.ArgumentParser(prog="newton-server", description="Run the local Newton app.")
+    ap.add_argument("--port", type=int, default=8770, help="port to serve on (default 8770)")
+    ap.add_argument("--open", action="store_true", help="open the app in your browser once it's up")
+    args = ap.parse_args()
+
+    url = f"http://127.0.0.1:{args.port}"
+    if not (FRONTEND_DIST / "index.html").is_file():
+        print("⚠  The web UI isn't built yet — run `cd frontend && npm run build` first.\n"
+              "   (Serving the legacy fallback UI for now.)")
+    print(f"\n  Newton is running — open {url}\n  Fully local · Ollama must be running · Ctrl+C to stop\n",
+          flush=True)
+    if args.open:
+        import threading
+        import webbrowser
+        threading.Timer(1.2, lambda: webbrowser.open(url)).start()
+    uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
 
 
 if __name__ == "__main__":

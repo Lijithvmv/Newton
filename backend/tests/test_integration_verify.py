@@ -70,7 +70,7 @@ def test_project_python_not_ready_without_requirements(tmp_path):
 
 def test_integration_check_catches_a_load_failure_then_repair_fixes_it(tmp_path, monkeypatch):
     monkeypatch.setenv("NEWTON_LOOP_SELFTEST", "0")          # isolate: only the integration gate runs
-    monkeypatch.setattr(LoopEngine, "_project_python", lambda self: (sys.executable, True))
+    monkeypatch.setattr(LoopEngine, "_project_python", lambda self, extra=(): (sys.executable, True))
     monkeypatch.setattr("newton.loop.engine.decompose",
                         lambda *a, **k: [Step(id="main", goal="", kind=WRITE, file="main.py")])
     # main.py imports fine as text but FAILS at import (NameError) — exactly what per-file parse
@@ -84,8 +84,60 @@ def test_integration_check_catches_a_load_failure_then_repair_fixes_it(tmp_path,
 
 def test_integration_check_off_by_env(tmp_path, monkeypatch):
     monkeypatch.setenv("NEWTON_LOOP_INTEGRATION", "0")
-    monkeypatch.setattr(LoopEngine, "_project_python", lambda self: (sys.executable, True))
+    monkeypatch.setattr(LoopEngine, "_project_python", lambda self, extra=(): (sys.executable, True))
     eng = LoopEngine(load_settings(tmp_path))
     state = LoopState(goal="g", steps=[_done("main.py", "app = 1\n", tmp_path)])
     eng._ensure_integration_check(state)
     assert not any(s.id == "i_run" for s in state.steps)     # disabled → no check added
+
+
+# --- the route probe: a web app that LOADS but a request 500s is caught (the request-time gap) ---
+
+def test_entry_is_asgi_true_only_for_a_web_app(tmp_path):
+    eng = LoopEngine(load_settings(tmp_path))
+    web = LoopState(goal="g", steps=[_done("main.py", "from fastapi import FastAPI\napp = FastAPI()\n", tmp_path)])
+    plain = LoopState(goal="g", steps=[_done("calc.py", "def add(a, b):\n    return a + b\n", tmp_path)])
+    assert eng._entry_is_asgi(web) is True
+    assert eng._entry_is_asgi(plain) is False
+
+_BAD_APP = (
+    "from fastapi import FastAPI\n"
+    "app = FastAPI()\n\n"
+    "@app.get('/')\n"
+    "def root():\n"
+    "    return {'value': undefined_name}\n"        # imports fine; raises only when the route is hit
+)
+_GOOD_APP = (
+    "from fastapi import FastAPI\n"
+    "app = FastAPI()\n\n"
+    "@app.get('/')\n"
+    "def root():\n"
+    "    return {'value': 1}\n"
+)
+
+def test_route_probe_catches_a_500_then_repair_fixes_it(tmp_path, monkeypatch):
+    """The core gap: every file passes its own verify AND the app imports cleanly, but a GET request
+    500s (a handler bug / contract mismatch). The probe drives the assembled app and catches it, then
+    the repair — routed to main.py by the self-reported culprit — rewrites the handler correct."""
+    monkeypatch.setenv("NEWTON_LOOP_SELFTEST", "0")
+    monkeypatch.setattr(LoopEngine, "_project_python", lambda self, extra=(): (sys.executable, True))
+    monkeypatch.setattr("newton.loop.engine.decompose",
+                        lambda *a, **k: [Step(id="main", goal="", kind=WRITE, file="main.py")])
+    ex = _WireExec(tmp_path, {"main.py": [_BAD_APP, _GOOD_APP]})
+    res = LoopEngine(load_settings(tmp_path), executor=ex).run("build a web app")
+    assert res.ok                                            # the app serves cleanly after repair
+    assert any(s.id == "i_run" and s.status == DONE for s in res.state.steps)
+    assert ex.ran and ".newton_integration.py" in ex.ran[-1]  # the ROUTE PROBE ran, not a plain import
+    assert (tmp_path / "main.py").read_text() == _GOOD_APP
+    assert not (tmp_path / ".newton_integration.py").exists()  # the probe artifact is cleaned up
+
+def test_route_probe_passes_a_clean_web_app_without_crying_wolf(tmp_path, monkeypatch):
+    monkeypatch.setenv("NEWTON_LOOP_SELFTEST", "0")
+    monkeypatch.setattr(LoopEngine, "_project_python", lambda self, extra=(): (sys.executable, True))
+    monkeypatch.setattr("newton.loop.engine.decompose",
+                        lambda *a, **k: [Step(id="main", goal="", kind=WRITE, file="main.py")])
+    ex = _WireExec(tmp_path, {"main.py": [_GOOD_APP]})       # only ever written once — no repair needed
+    res = LoopEngine(load_settings(tmp_path), executor=ex).run("build a web app")
+    assert res.ok
+    assert ex.ran and ".newton_integration.py" in ex.ran[-1]
+    assert ex.writes["main.py"] == []                        # written exactly once (probe didn't false-fail)

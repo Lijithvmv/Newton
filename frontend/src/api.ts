@@ -161,8 +161,15 @@ export interface RunActivity {
   status: "running" | "done" | "failed" | string;
   started: number;
   ok: boolean;
+  project?: string;
+  effort?: string;
+  model?: string | null;
+  resumable?: boolean;        // an interrupted Build that can be continued from its checkpoint
+  answer?: string;
+  finished?: number;
+  evidence?: { verified: boolean; checks: number; checks_passed: number; artifacts: number } | null;
 }
-/** Recent runs (in-progress + lately finished) for the activity feed. */
+/** Recent runs, newest first — persisted, so history survives a restart. */
 export async function fetchRuns(): Promise<RunActivity[]> {
   try {
     const r = await fetch("/api/runs");

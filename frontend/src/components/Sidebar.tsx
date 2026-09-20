@@ -1,6 +1,6 @@
 import { Icon } from "./icons";
 
-export type View = "overview" | "workspace" | "knowledge" | "wiki" | "skills" | "memory" | "components";
+export type View = "overview" | "workspace" | "history" | "knowledge" | "wiki" | "skills" | "memory" | "components";
 
 type Item = { view: View; icon: string; label: string };
 
@@ -10,6 +10,7 @@ const GROUPS: { label?: string; items: Item[] }[] = [
     items: [
       { view: "overview", icon: "list", label: "Overview" },
       { view: "workspace", icon: "terminal", label: "Workspace" },
+      { view: "history", icon: "clock", label: "History" },
     ],
   },
   {

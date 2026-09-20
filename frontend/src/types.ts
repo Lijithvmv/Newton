@@ -20,6 +20,15 @@ export interface RunRequest {
   mode: Mode;
   doc_type?: DocType;
   effort?: EffortLevel;
+  resume?: boolean;           // mode="project": continue this project's checkpointed Build
+}
+
+// The loop's compute budget for a run — surfaced so the user sees the run is BOUNDED (the "quota").
+export interface LoopBudget {
+  effort: string;
+  attempts: number;   // best-of-N candidates per step
+  repairs: number;    // failing-check → code-fix cycles
+  replans: number;    // whole-plan re-decompositions
 }
 
 export interface ContextBlock {
@@ -60,6 +69,15 @@ export interface Blueprint {
 
 export type TaskStatus = "pending" | "running" | "done" | "failed" | "blocked";
 
+// Evidence-binding: what a finished run proved — the checks that ran + a fingerprint of each file.
+export interface EvidenceCheck { id: string; goal: string; passed: boolean; detail: string; }
+export interface EvidenceArtifact { file: string; sha256: string; bytes: number; }
+export interface Evidence {
+  verified: boolean;
+  checks: EvidenceCheck[];
+  artifacts: EvidenceArtifact[];
+}
+
 export interface GatePayload {
   kind: string;
   args: { path?: string };
@@ -79,6 +97,7 @@ export type ThreadItem =
   | { kind: "backlog"; tasks: BacklogTask[] }
   | { kind: "taskhead"; id: string; title: string }
   | { kind: "answer"; text: string }
+  | { kind: "evidence"; evidence: Evidence }
   | { kind: "final"; ok: boolean; text: string };
 
 // Raw SSE envelope: { ch, payload }.

@@ -26,9 +26,11 @@ from ..config import Settings
 from ..context import project_tree
 from ..index.graph import _module_of
 from ..tools import ToolBelt
+from .decide import error_signature
 from .decompose import decompose
 from .effort import Effort
 from .effort import effort as _resolve_effort
+from .evidence import Evidence, collect_evidence
 from .execute import NativeStepExecutor, StepExecutor, StepResult
 from .state import BLOCKED, DONE, FAILED, PENDING, RUN, RUNNING, WRITE, LoopState, Step
 
@@ -48,12 +50,96 @@ _EXTERNAL_DEPS = {
     "pandas", "requests", "aiohttp", "redis", "click", "rich", "typer", "yaml", "dotenv",
 }
 
+# Generated probe for the whole-app integration check on an ASGI (FastAPI/Starlette) app. A plain
+# `import entry` proves the app LOADS; it says nothing about whether a request works. This drives the
+# assembled app through an in-process test client and GETs every no-argument route, failing on any
+# server error (5xx or a handler that raises) — the request-time class of bug that broke the first
+# real full-stack run (a frontend/backend contract mismatch that every per-file verify passed). It
+# self-reports `culprit: <file>` from the traceback so the repair loop can target the handler, and
+# skips quietly (exit 0) when there's no ASGI app or no test client, so it never cries wolf.
+_INTEGRATION_PROBE = r'''"""Newton whole-app integration probe (generated — safe to delete)."""
+import importlib, os, re, sys, traceback
+
+ENTRY = "__ENTRY__"
+ROOT = os.path.dirname(os.path.abspath(__file__))
+PROBE = os.path.basename(os.path.abspath(__file__))
+
+
+def _culprit(text):
+    """The deepest project .py file named in a traceback — the handler to fix (not stdlib/deps)."""
+    for fn in reversed(re.findall(r'File "([^"]+\.py)"', text)):
+        ab = os.path.abspath(fn)
+        norm = ab.replace("\\", "/")
+        if ab.startswith(ROOT) and "site-packages" not in norm and os.path.basename(ab) != PROBE:
+            return os.path.relpath(ab, ROOT).replace("\\", "/")
+    return "?"
+
+
+try:
+    mod = importlib.import_module(ENTRY)
+except Exception:
+    tb = traceback.format_exc()
+    print("FAILED import %s -- culprit: %s" % (ENTRY, _culprit(tb)))
+    print(tb)
+    sys.exit(1)
+
+try:
+    from starlette.applications import Starlette
+    from starlette.testclient import TestClient
+except Exception as exc:
+    print("integration: no test client available (%s) -- load-only, ok" % exc)
+    sys.exit(0)
+
+app = None
+for _name in dir(mod):
+    _obj = getattr(mod, _name, None)
+    if isinstance(_obj, Starlette):
+        app = _obj
+        break
+if app is None:
+    print("integration: no ASGI app object on %s -- load-only, ok" % ENTRY)
+    sys.exit(0)
+
+skip = {"/openapi.json", "/docs", "/redoc", "/docs/oauth2-redirect"}
+paths = []
+for route in getattr(app, "routes", []):
+    methods = getattr(route, "methods", None) or set()
+    path = getattr(route, "path", "") or ""
+    if "GET" in methods and "{" not in path and path not in skip:
+        paths.append(path)
+
+fails = []
+try:
+    with TestClient(app) as client:
+        for p in paths:
+            try:
+                resp = client.get(p)
+                if resp.status_code >= 500:
+                    fails.append("FAILED GET %s -> HTTP %d\n%s" % (p, resp.status_code, (resp.text or "")[:600]))
+            except Exception:
+                tb = traceback.format_exc()
+                fails.append("FAILED GET %s raised -- culprit: %s\n%s" % (p, _culprit(tb), tb))
+except Exception:
+    tb = traceback.format_exc()
+    print("FAILED app startup -- culprit: %s" % _culprit(tb))
+    print(tb)
+    sys.exit(1)
+
+if fails:
+    print("INTEGRATION: %d route(s) returned a server error:" % len(fails))
+    for f in fails:
+        print(f)
+    sys.exit(1)
+print("integration ok: probed %d GET route(s), no server errors" % len(paths))
+'''
+
 
 @dataclass
 class LoopResult:
     ok: bool
     answer: str
     state: LoopState | None = None
+    evidence: Evidence | None = None       # what the run proved — checks that ran + file fingerprints
 
 
 class ContextShaper:
@@ -233,6 +319,8 @@ class LoopEngine:
         self.checkpoint_path = self.root / ".newton" / checkpoint
         self._pending_error: dict[str, str] = {}      # step id → error to inject into its next context
         self._extra_temp: dict[str, float] = {}       # step id → added temperature (rises each repair)
+        self._repair_history: list[tuple[str, str]] = []  # (culprit id, error signature) already tried —
+        #                                                   feeds repair-progress routing (loop/decide.py)
         # Parallel step execution: independent ready steps (distinct files, no dep path between them)
         # run concurrently. Default 1 (sequential, unchanged). It's real work overlap — the model
         # calls are blocking HTTP so threads release the GIL — but the actual speedup depends on the
@@ -265,6 +353,11 @@ class LoopEngine:
         if state is None:
             return LoopResult(False, "could not decompose the goal into steps")
 
+        # Surface the loop's budget so the user sees the run is BOUNDED, not open-ended — the caps
+        # that would otherwise be hidden module constants (loopx's "quota" idea). Progress (N of M
+        # steps) the UI derives from the plan + step events; this makes the ceiling explicit.
+        self.emit("budget", {"effort": self.effort.name, "attempts": self.effort.max_attempts,
+                             "repairs": self.effort.repair_cycles, "replans": self.effort.replan_cycles})
         self._drive(state)
         # Self-generated verification: if the plan built code but planned no check, write a
         # goal-grounded test and run it — so a step's LOGIC is validated even when the model forgot
@@ -389,6 +482,24 @@ class LoopEngine:
                                   f"keeping their interface.")
                 msg += "\n\n" + blast
             self._pending_error[culprit.id] = msg
+        # --- Confidence routing (the local, honest "decision + confidence"): don't keep spending
+        # repairs on a fix that isn't working. If we have ALREADY tried to fix THIS file for THIS same
+        # error and it came back unchanged, another repair (even a hotter best-of-N candidate) has low
+        # odds — so escalate: return False and let run() fall through to REPLAN instead of burning the
+        # budget re-fixing a file we can't crack (the thrash the ledger diagnostic showed). The signal
+        # is trajectory-derived, needs no calibrated model probability, and only ever makes the loop
+        # MORE cautious. Kill-switch: NEWTON_LOOP_REPAIR_PROGRESS=0.
+        sig = error_signature(failed.result)
+        if os.getenv("NEWTON_LOOP_REPAIR_PROGRESS", "1") != "0" \
+                and (culprit.id, sig) in self._repair_history:
+            self._pending_error.pop(culprit.id, None)
+            self.emit("note", f"Repair isn't making progress on {culprit.file or culprit.id} — the "
+                              f"same error persists after a fix. Escalating (re-plan) instead of "
+                              f"re-fixing it again.")
+            state.log.append(f"repair-stalled {culprit.id}: {sig[:80]}")
+            state.save(self.checkpoint_path)
+            return False
+        self._repair_history.append((culprit.id, sig))
         culprit.status = PENDING
         culprit.result = ""
         # Each repair explores a MORE different fix (best-of-N over cycles), not the same broken one.
@@ -568,33 +679,57 @@ class LoopEngine:
         used but never imported). After the build, import the app's entrypoint in a subprocess with
         its real dependencies installed; a failure that names a project file feeds the normal repair.
 
-        Deliberately a SMOKE check, and honest about it: it catches 'the app doesn't load', not pure
-        request-time logic bugs (those need a running server + client). Needs a requirements.txt so
-        deps can be made available — without one an import would fail on a third-party module, not a
-        real bug, so we skip rather than cry wolf. Off with NEWTON_LOOP_INTEGRATION=0."""
+        For a web app it goes further than a smoke load: it PROBES the assembled app — drives it
+        through an in-process test client and GETs every no-argument route, failing on a 5xx or a
+        handler that raises. That catches the request-time class of bug (a frontend/backend contract
+        mismatch, a handler that crashes on a basic request) that a per-file verify and a plain
+        import both pass — the exact gap the first real full-stack run hit. For a non-web app it
+        falls back to the plain load check. Either way a failure that names a project file feeds the
+        normal repair. Needs a requirements.txt so deps are real (else a missing package would look
+        like a bug); without one we skip rather than cry wolf. Off with NEWTON_LOOP_INTEGRATION=0."""
         if os.getenv("NEWTON_LOOP_INTEGRATION", "1") == "0":
             return
-        if any(s.id == "i_run" for s in state.steps):
-            return                                       # already added (e.g. on resume)
+        existing = next((s for s in state.steps if s.id == "i_run"), None)
+        if existing is not None and existing.status == DONE:
+            return                                       # already passed (e.g. on resume)
         entry = self._detect_entrypoint(state)
         if not entry:
             return
-        py, ready = self._project_python()
+        asgi = self._entry_is_asgi(state)
+        py, ready = self._project_python(extra=("httpx",) if asgi else ())
         if not ready:
             self.emit("note", "Skipping the whole-app check — couldn't prepare its dependencies.")
             return
-        self.emit("note", "Checking the whole app loads together…")
-        step = Step(id="i_run", kind=RUN, command=f'"{py}" -B -c "import {entry}"',
-                    goal=f"import {entry} — confirm the assembled app loads")
-        state.steps.append(step)
-        state.save(self.checkpoint_path)
-        self.emit("plan", [{"id": step.id, "goal": step.goal, "kind": step.kind,
-                            "file": step.file, "depends_on": step.depends_on}])
-        self._run_step(step, state)
-        for _ in range(self.effort.repair_cycles):       # a load failure fixes the file it blames
-            if not self._repair_from_test_failure(state):
-                break
-            self._drive(state)
+        probe = self.root / ".newton_integration.py"
+        try:
+            if asgi:
+                probe.write_text(self._integration_probe(entry), encoding="utf-8")
+                command = f'"{py}" -B ".newton_integration.py"'
+                goal = f"probe {entry}'s routes — confirm the assembled app serves without errors"
+                self.emit("note", "Checking the whole app serves its routes without errors…")
+            else:
+                command = f'"{py}" -B -c "import {entry}"'
+                goal = f"import {entry} — confirm the assembled app loads"
+                self.emit("note", "Checking the whole app loads together…")
+            step = existing
+            if step is None:
+                step = Step(id="i_run", kind=RUN, command=command, goal=goal)
+                state.steps.append(step)
+            else:                                        # resumed mid-gate — refresh and re-run
+                step.command, step.goal, step.status = command, goal, PENDING
+            state.save(self.checkpoint_path)
+            self.emit("plan", [{"id": step.id, "goal": step.goal, "kind": step.kind,
+                                "file": step.file, "depends_on": step.depends_on}])
+            self._run_step(step, state)
+            for _ in range(self.effort.repair_cycles):   # a failure fixes the file it blames
+                if not self._repair_from_test_failure(state):
+                    break
+                self._drive(state)
+        finally:
+            try:
+                probe.unlink()                           # the probe is a check artifact, not output
+            except OSError:
+                pass
 
     def _detect_entrypoint(self, state: LoopState) -> str | None:
         """The module to import as the app's entrypoint — the file most likely to wire the app
@@ -620,10 +755,12 @@ class LoopEngine:
             return None
         return _module_of(best.file.replace("\\", "/"))
 
-    def _project_python(self) -> tuple[str, bool]:
+    def _project_python(self, extra: tuple[str, ...] = ()) -> tuple[str, bool]:
         """(python to run the check, deps-ready). With a requirements.txt, build/reuse a project
         .venv and install into it so third-party imports resolve — then a failed import is a REAL
-        bug, not a missing package. Without one, we can't guarantee deps, so report not-ready."""
+        bug, not a missing package. Without one, we can't guarantee deps, so report not-ready.
+        `extra` names packages the CHECK itself needs (e.g. `httpx` for the route probe's test
+        client) that the app may not list — installed on top of the app's own requirements."""
         req = self.root / "requirements.txt"
         if not req.is_file():
             return sys.executable, False
@@ -635,9 +772,31 @@ class LoopEngine:
                                capture_output=True, timeout=180, check=True)
             subprocess.run([str(py), "-m", "pip", "install", "-q", "-r", str(req)],
                            capture_output=True, timeout=600, check=True)
+            if extra:
+                subprocess.run([str(py), "-m", "pip", "install", "-q", *extra],
+                               capture_output=True, timeout=300, check=True)
         except (subprocess.SubprocessError, OSError):
             return sys.executable, False
         return str(py), True
+
+    def _entry_is_asgi(self, state: LoopState) -> bool:
+        """Does the build declare a FastAPI/Starlette app? If so the whole-app check should PROBE its
+        routes (does a request work?), not merely import it (does it load?). Cheap text scan of the
+        built Python files — an APIRouter or a FastAPI/Starlette constructor is the tell."""
+        for s in state.steps:
+            if s.status == DONE and s.kind != RUN and s.file.endswith(".py"):
+                try:
+                    t = (self.root / s.file).read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    continue
+                if "FastAPI(" in t or "Starlette(" in t or "APIRouter(" in t:
+                    return True
+        return False
+
+    @staticmethod
+    def _integration_probe(entry: str) -> str:
+        """The generated route-probe script for `entry`'s ASGI app (see `_INTEGRATION_PROBE`)."""
+        return _INTEGRATION_PROBE.replace("__ENTRY__", entry)
 
     @staticmethod
     def _reid(steps: list[Step], prefix: str) -> list[Step]:
@@ -711,9 +870,15 @@ class LoopEngine:
                   f"of {len(state.steps)} steps.")
         vd = self._run_verdict(state)
         self.emit("verdict", {"level": vd.level, "label": vd.label, "reason": vd.reason})
-        answer = f"[{vd.label}] {counts} — {vd.reason}"
+        # Evidence-binding: attach what the run PROVED — the checks that ran (tests, route probe) and
+        # a content fingerprint of every produced file — so the verdict is trustworthy without a
+        # re-run. Emitted for the live view and returned on the result for the History log.
+        ev = collect_evidence(state, self.root)
+        self.emit("evidence", ev.as_dict())
+        proof = f" · proof: {ev.checks_passed}/{len(ev.checks)} checks, {len(ev.artifacts)} files"
+        answer = f"[{vd.label}] {counts} — {vd.reason}{proof if ev.checks or ev.artifacts else ''}"
         self.emit("loop", {"ok": ok, "answer": answer, "counts": c})
-        return LoopResult(ok, answer, state)
+        return LoopResult(ok, answer, state, evidence=ev)
 
     def _load_or_plan(self, goal: str, resume: bool) -> LoopState | None:
         if resume and self.checkpoint_path.is_file():

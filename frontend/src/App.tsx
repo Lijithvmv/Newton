@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { Composer } from "./components/Composer";
 import { ContextInspector } from "./components/ContextInspector";
 import { GateCard } from "./components/GateCard";
+import { History } from "./components/History";
+import { LoopProgress } from "./components/LoopProgress";
 import { Overview } from "./components/Overview";
 import { ComponentsPanel, KnowledgePanel, MemoryPanel, SkillsPanel, WikiPanel } from "./components/Panels";
 import { Sidebar, type View } from "./components/Sidebar";
@@ -31,6 +33,18 @@ export default function App() {
     setView("workspace");
   };
 
+  // Resume an interrupted Build from History: switch to the Build workspace on its project/effort and
+  // re-run with resume=true, so the LoopEngine continues from its checkpoint instead of restarting.
+  const resumeRun = (r: { task: string; project?: string; effort?: string }) => {
+    const proj = r.project || project;
+    const eff = (r.effort as EffortLevel) || effort;
+    setProject(proj);
+    setEffort(eff);
+    setMode("project");
+    setView("workspace");
+    run(r.task, proj, auto, "project", undefined, eff, true);
+  };
+
   return (
     <>
       <TopBar mode={mode} setMode={chooseMode} models={state.models} model={model} setModel={setModel} />
@@ -46,6 +60,9 @@ export default function App() {
                     {mode === "chat" ? "Ask" : mode === "project" ? "Build" : mode === "author" ? "Author" : mode === "report" ? "Report" : "Code"}
                   </span>
                 </div>
+                {mode === "project" && (
+                  <LoopProgress taskStatus={state.taskStatus} budget={state.budget} running={state.running} />
+                )}
                 <Thread
                   thread={state.thread}
                   stages={state.stages}
@@ -79,6 +96,7 @@ export default function App() {
           {view !== "workspace" && (
             <div className="viewfade" key={view}>
               {view === "overview" && <Overview model={model} onOpen={setView} onStart={chooseMode} />}
+              {view === "history" && <History onResume={resumeRun} />}
               {view === "knowledge" && <KnowledgePanel />}
               {view === "wiki" && <WikiPanel />}
               {view === "skills" && <SkillsPanel />}

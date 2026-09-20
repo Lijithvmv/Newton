@@ -125,6 +125,44 @@ function Item({ it, status }: { it: ThreadItem; status: Record<string, TaskStatu
           <ReactMarkdown remarkPlugins={[remarkGfm]}>{it.text}</ReactMarkdown>
         </div>
       );
+    case "evidence": {
+      const ev = it.evidence;
+      if (!ev.checks.length && !ev.artifacts.length) return null;
+      return (
+        <div className={`evidence ${ev.verified ? "ok" : "bad"}`}>
+          <div className="evhead">
+            <Icon name={ev.verified ? "check" : "alert"} size={14} />
+            <b>Evidence</b>
+            <span className="evsum">
+              {ev.checks.filter((c) => c.passed).length}/{ev.checks.length} checks · {ev.artifacts.length} files
+              {ev.verified ? " · verified" : " · unverified"}
+            </span>
+          </div>
+          {ev.checks.length > 0 && (
+            <ul className="evchecks">
+              {ev.checks.map((c) => (
+                <li key={c.id} className={c.passed ? "pass" : "fail"}>
+                  <Icon name={c.passed ? "check" : "x"} size={12} />
+                  <span className="evgoal">{c.goal}</span>
+                  {c.detail && <span className="evdetail">{c.detail.split("\n")[0].slice(0, 90)}</span>}
+                </li>
+              ))}
+            </ul>
+          )}
+          {ev.artifacts.length > 0 && (
+            <ul className="evfiles">
+              {ev.artifacts.map((a) => (
+                <li key={a.file}>
+                  <span className="evfile">{a.file}</span>
+                  <span className="evhash">{a.sha256.slice(0, 10)}</span>
+                  <span className="evbytes">{a.bytes} B</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      );
+    }
     case "final":
       return <div className={`final ${it.ok ? "ok" : "bad"}`}>{it.text}</div>;
   }

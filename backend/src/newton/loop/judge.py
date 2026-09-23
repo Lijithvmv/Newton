@@ -17,6 +17,7 @@ without it.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from pathlib import Path
@@ -60,7 +61,14 @@ class LayaJudge:
 
     def _load(self) -> None:
         try:
-            import laya  # type: ignore
+            # Load-time fixes (measured: >180s hang -> ~16s CPU). The real one is laya >= 0.3.7 —
+            # < 0.3.7 deadlocks on newer Windows Python. These flags are cheap, safe defaults an
+            # operator can override: skip the TF runtime probe (we have no TensorFlow), and disable
+            # oneDNN. HF_HUB_OFFLINE is deliberately NOT forced — the first load must be able to
+            # download the weights; set it yourself to skip HF network probes on repeat loads.
+            os.environ.setdefault("USE_TF", "0")
+            os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+            import laya  # type: ignore   (needs laya >= 0.3.7; 0.3.10+ recommended)
             agent = laya.load(self.model)
             with LayaJudge._lock:
                 LayaJudge._agent = agent

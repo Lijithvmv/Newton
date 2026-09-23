@@ -110,6 +110,7 @@ def test_collector_captures_intermediate_failures(tmp_path, monkeypatch):
     assert [r["truth_failure"] for r in rows] == [True, False]   # the failed attempt is in the corpus
     assert all(r["correct"] for r in rows)
     assert len({r["run_id"] for r in rows}) == 1 and rows[0]["command"] == "pytest"
+    assert rows[0]["output"] == "=== 1 FAILED, 2 passed ==="  # re-scorable by another judge
 
 
 def test_collector_dedupes_and_never_blocks(tmp_path):

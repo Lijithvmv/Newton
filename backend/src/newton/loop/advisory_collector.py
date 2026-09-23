@@ -27,6 +27,8 @@ from typing import Any
 
 from .judge import append_advisory
 
+OUTPUT_CHARS = 2000    # tail of the check output stored per row (the verdict lives at the end of a log)
+
 
 class AdvisoryCollector:
     """One background worker per run. `record()` is non-blocking; `shutdown()` drains the backlog and
@@ -85,7 +87,8 @@ class AdvisoryCollector:
             "run_id": run_id, "iteration": iteration, "command": (command or "")[:120],
             "truth_failure": truth_failure, "pred_failure": pred_failure,
             "p_failure": round(p_failure, 4), "confidence": d.confidence,
-            "correct": pred_failure == truth_failure})
+            "correct": pred_failure == truth_failure,
+            "output": output[-OUTPUT_CHARS:]})       # kept so the corpus can be re-scored by another judge
 
     def drain(self) -> None:
         """Block until every queued judgment has been processed and written."""

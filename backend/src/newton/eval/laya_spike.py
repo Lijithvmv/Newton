@@ -111,6 +111,25 @@ class LayaDecider:
         return Pred(label=p >= 0.5, confidence=conf)
 
 
+class _EnsembleSpikeDecider:
+    """The proposed acting decider: the deterministic marker floor (never false-positives) plus Laya
+    only in its HIGH-confidence band. The Rule-4 question this answers: does it keep the regex's
+    precision while recovering the marker-less failures Laya catches?"""
+    name = "ensemble (regex floor + high-conf laya)"
+
+    def __init__(self, laya: LayaDecider, high: float = 0.9) -> None:
+        self.laya = laya
+        self.high = high
+
+    def predict(self, text: str) -> Pred:
+        if error_shaped(text):
+            return Pred(label=True, confidence=1.0)             # deterministic floor
+        pr = self.laya.predict(text)
+        if pr.label and pr.confidence >= self.high:             # trust Laya only when confident
+            return Pred(label=True, confidence=pr.confidence)
+        return Pred(label=False, confidence=max(pr.confidence, 1.0 - pr.confidence))
+
+
 def score(decider: Decider) -> dict:
     tp = fp = fn = tn = 0
     confs: list[tuple[float, bool]] = []       # (confidence, correct) for calibration/coverage
@@ -176,7 +195,9 @@ def main() -> int:
     deciders: list[Decider] = [HeuristicDecider()]
     laya_err = None
     try:
-        deciders.append(LayaDecider())
+        laya = LayaDecider()
+        deciders.append(laya)
+        deciders.append(_EnsembleSpikeDecider(laya))   # the Rule-4 gate: does floor+high-conf beat both?
     except RuntimeError as e:
         laya_err = str(e)
 
@@ -192,7 +213,7 @@ def main() -> int:
         print(f"[{d.name}]")
         print(f"  acc {s['acc']:.2f}  prec {s['prec']:.2f}  rec {s['rec']:.2f}  f1 {s['f1']:.2f}  "
               f"(tp {s['tp']} fp {s['fp']} fn {s['fn']} tn {s['tn']})")
-        if d.name.startswith("laya"):
+        if "laya" in d.name:
             print(f"  ECE {s['ece']:.3f} (0 = perfectly calibrated)")
             cov = _coverage_curve(s["confs"])
             print("  coverage curve (act above threshold):")

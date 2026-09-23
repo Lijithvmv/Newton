@@ -930,11 +930,13 @@ class LoopEngine:
                     continue
                 truth_failure = s.status != DONE           # ground truth: did the check actually fail?
                 pred_failure = d.answer == "failure"
+                p_failure = d.confidence if pred_failure else 1.0 - d.confidence
                 d.reason += f" | truth={'failure' if truth_failure else 'ok'}"
                 self._decisions.append(d)
                 append_advisory(log_path, {
                     "check": s.id, "truth_failure": truth_failure, "pred_failure": pred_failure,
-                    "confidence": d.confidence, "correct": pred_failure == truth_failure})
+                    "p_failure": round(p_failure, 4), "confidence": d.confidence,
+                    "correct": pred_failure == truth_failure})
         except Exception:
             pass                                           # advisory must never break a run
 

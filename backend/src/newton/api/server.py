@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import queue
 import shutil
 import tempfile
@@ -52,6 +53,13 @@ _savings.configure(_REPO_ROOT)
 # Durable run history — survives a server restart, so the Overview feed and History view show real
 # past runs and an interrupted Build can be resumed. Runtime state under .newton/ (gitignored).
 _runlog = RunLog(_REPO_ROOT / ".newton" / "runs.json")
+
+# Advisory Laya judge (opt-in, eval-first): kick its background model load at startup so it's ready by
+# the time a build finishes — the judge never blocks a run, and this just avoids the first run missing
+# it. Only when explicitly enabled, so the heavy deps never load otherwise.
+if os.getenv("NEWTON_LOOP_ADVISORY_JUDGE") == "1":
+    from ..loop.judge import LayaJudge
+    LayaJudge().start_loading()
 
 
 def _build_resumable(project: str) -> bool:

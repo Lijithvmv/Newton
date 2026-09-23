@@ -33,6 +33,7 @@ from .effort import Effort
 from .effort import effort as _resolve_effort
 from .evidence import Evidence, collect_evidence
 from .execute import NativeStepExecutor, StepExecutor, StepResult
+from .judge import LayaJudge, append_advisory
 from .state import BLOCKED, DONE, FAILED, PENDING, RUN, RUNNING, WRITE, LoopState, Step
 
 # The historical caps, kept as the definition of the `normal` effort level (see loop/effort.py).
@@ -300,10 +301,12 @@ class LoopEngine:
                  shaper: ContextShaper | None = None,
                  emit: Callable[[str, Any], None] | None = None,
                  effort: Effort | None = None,
+                 judge: Any = None,
                  checkpoint: str = "loop.json") -> None:
         self.s = settings
         self.root = Path(settings.project_root)
         self.emit = emit or (lambda *a: None)
+        self._judge = judge                            # optional advisory judge (Laya); injected in tests
         # How much free local compute this run may spend to reach verified quality. `normal` == the
         # historical constants, so the default is a no-op; higher levels push the SAME model harder
         # (more attempts / wider retrieval / more replans), the lever that only free-token, unlimited-
@@ -893,6 +896,7 @@ class LoopEngine:
             name="verdict", kind=SCORE,
             question="Is the finished build trustworthy?",
             answer=vd.label, confidence=1.0, reason=vd.reason))
+        self._advisory_judge(state)                    # opt-in: Laya scores checks alongside truth (no-op otherwise)
         # Evidence-binding: attach what the run PROVED — the checks that ran (tests, route probe), a
         # content fingerprint of every produced file, AND the bounded DECISIONS the loop took (each
         # with its confidence + reason — the "keep the probabilities" discipline) — so the verdict is
@@ -903,6 +907,36 @@ class LoopEngine:
         answer = f"[{vd.label}] {counts} — {vd.reason}{proof if ev.checks or ev.artifacts else ''}"
         self.emit("loop", {"ok": ok, "answer": answer, "counts": c})
         return LoopResult(ok, answer, state, evidence=ev)
+
+    def _advisory_judge(self, state: LoopState) -> None:
+        """Eval-first (never acts): score each check's output with the advisory Laya judge and record
+        its answer as a Decision ALONGSIDE the deterministic ground truth, appending the pair to the
+        advisory log. This is the doc's safe placement — it changes nothing the loop does; over real
+        runs the log becomes a labeled corpus to measure Laya's agreement/drift on Newton's own
+        outputs. Off by default; enable with NEWTON_LOOP_ADVISORY_JUDGE=1 (or inject a judge in tests).
+        Fully fail-soft — an advisory error never touches the run's result."""
+        judge = self._judge
+        if judge is None:
+            if os.getenv("NEWTON_LOOP_ADVISORY_JUDGE", "0") != "1":
+                return
+            judge = LayaJudge()
+        try:
+            log_path = self.root / ".newton" / "advisory.jsonl"
+            for s in state.steps:
+                if s.kind != RUN or not s.result:
+                    continue
+                d = judge.judge_failure(s.result)
+                if d is None:
+                    continue
+                truth_failure = s.status != DONE           # ground truth: did the check actually fail?
+                pred_failure = d.answer == "failure"
+                d.reason += f" | truth={'failure' if truth_failure else 'ok'}"
+                self._decisions.append(d)
+                append_advisory(log_path, {
+                    "check": s.id, "truth_failure": truth_failure, "pred_failure": pred_failure,
+                    "confidence": d.confidence, "correct": pred_failure == truth_failure})
+        except Exception:
+            pass                                           # advisory must never break a run
 
     def _load_or_plan(self, goal: str, resume: bool) -> LoopState | None:
         if resume and self.checkpoint_path.is_file():

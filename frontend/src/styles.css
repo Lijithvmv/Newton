@@ -725,6 +725,14 @@ button.ovcard { cursor: pointer; font: inherit; color: inherit; }
 .evfile { color: var(--text); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .evhash { color: var(--accent); }
 .evbytes { color: var(--text-3); flex: none; }
+.evdecisions { list-style: none; margin: 10px 0 0; padding: 9px 0 0; border-top: 1px solid var(--hairline); display: flex; flex-direction: column; gap: 5px; }
+.evdecisions li { display: flex; align-items: center; gap: 10px; font-size: 12px; }
+.evdname { color: var(--text-2); text-transform: capitalize; flex: none; min-width: 92px; }
+.evdanswer { color: var(--text); font: 11.5px var(--mono); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.evdconf { flex: none; font-weight: 700; font-size: 11px; padding: 1px 7px; border-radius: 999px; cursor: help; }
+.evdconf.hi { background: var(--good-soft); color: var(--good); }
+.evdconf.mid { background: var(--warn-soft, var(--accent-soft)); color: var(--warn, var(--accent)); }
+.evdconf.lo { background: var(--bad-soft); color: var(--bad); }
 
 /* Designed empty states — icon mark + heading + hint, instead of a bare line in a void. */
 .emptystate { max-width: 440px; margin: 11vh auto 0; text-align: center; animation: viewIn .3s ease both; }

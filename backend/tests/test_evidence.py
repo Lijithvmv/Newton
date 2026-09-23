@@ -54,4 +54,4 @@ def test_summary_is_compact(tmp_path):
         Step(id="c", goal="t", kind=RUN, command="pytest", status=DONE, result="ok"),
     ])
     assert collect_evidence(state, tmp_path).summary() == {
-        "verified": True, "checks": 1, "checks_passed": 1, "artifacts": 2}
+        "verified": True, "checks": 1, "checks_passed": 1, "artifacts": 2, "decisions": 0}

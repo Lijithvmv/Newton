@@ -72,10 +72,15 @@ export type TaskStatus = "pending" | "running" | "done" | "failed" | "blocked";
 // Evidence-binding: what a finished run proved — the checks that ran + a fingerprint of each file.
 export interface EvidenceCheck { id: string; goal: string; passed: boolean; detail: string; }
 export interface EvidenceArtifact { file: string; sha256: string; bytes: number; }
+export interface DecisionRecord {
+  name: string; kind: string; question: string; answer: string;
+  confidence: number; reason: string; decider: string;
+}
 export interface Evidence {
   verified: boolean;
   checks: EvidenceCheck[];
   artifacts: EvidenceArtifact[];
+  decisions?: DecisionRecord[];
 }
 
 export interface GatePayload {

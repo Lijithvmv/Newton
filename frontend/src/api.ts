@@ -167,7 +167,7 @@ export interface RunActivity {
   resumable?: boolean;        // an interrupted Build that can be continued from its checkpoint
   answer?: string;
   finished?: number;
-  evidence?: { verified: boolean; checks: number; checks_passed: number; artifacts: number } | null;
+  evidence?: { verified: boolean; checks: number; checks_passed: number; artifacts: number; decisions?: number } | null;
 }
 /** Recent runs, newest first — persisted, so history survives a restart. */
 export async function fetchRuns(): Promise<RunActivity[]> {

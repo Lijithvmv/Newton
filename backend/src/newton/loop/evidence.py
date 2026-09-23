@@ -14,6 +14,7 @@ import hashlib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from .decision import Decision
 from .state import DONE, RUN, LoopState
 
 
@@ -39,6 +40,7 @@ class Evidence:
     verified: bool                                  # every step done AND every check passed
     checks: list[Check] = field(default_factory=list)
     artifacts: list[Artifact] = field(default_factory=list)
+    decisions: list[Decision] = field(default_factory=list)   # bounded forks + confidence (auditable)
 
     @property
     def checks_passed(self) -> int:
@@ -47,10 +49,13 @@ class Evidence:
     def summary(self) -> dict:
         """A compact form for the run log / History — counts only, no large detail blobs."""
         return {"verified": self.verified, "checks": len(self.checks),
-                "checks_passed": self.checks_passed, "artifacts": len(self.artifacts)}
+                "checks_passed": self.checks_passed, "artifacts": len(self.artifacts),
+                "decisions": len(self.decisions)}
 
     def as_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        d["decisions"] = [dec.as_dict() for dec in self.decisions]   # rounded confidence, stable shape
+        return d
 
 
 def _sha256(path: Path) -> tuple[str, int]:
@@ -58,10 +63,12 @@ def _sha256(path: Path) -> tuple[str, int]:
     return hashlib.sha256(data).hexdigest(), len(data)
 
 
-def collect_evidence(state: LoopState, root: Path) -> Evidence:
+def collect_evidence(state: LoopState, root: Path,
+                     decisions: list[Decision] | None = None) -> Evidence:
     """Build the evidence record from a finished loop state: the checks that ran (RUN steps) with
-    their outcome, and a sha256 fingerprint of each produced file that exists on disk. Best-effort on
-    the hashes — a file that vanished is simply omitted, never an error."""
+    their outcome, a sha256 fingerprint of each produced file that exists on disk, and the bounded
+    DECISIONS the loop took (passed in from the engine). Best-effort on the hashes — a file that
+    vanished is simply omitted, never an error."""
     checks = [Check(id=s.id, goal=s.goal or s.command or s.id,
                     passed=s.status == DONE, detail=(s.result or "")[:600])
               for s in state.steps if s.kind == RUN]
@@ -80,4 +87,5 @@ def collect_evidence(state: LoopState, root: Path) -> Evidence:
         except OSError:
             continue
     verified = state.all_done() and all(c.passed for c in checks)
-    return Evidence(verified=verified, checks=checks, artifacts=artifacts)
+    return Evidence(verified=verified, checks=checks, artifacts=artifacts,
+                    decisions=list(decisions or []))

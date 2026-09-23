@@ -27,6 +27,7 @@ from ..context import project_tree
 from ..index.graph import _module_of
 from ..tools import ToolBelt
 from .decide import error_signature
+from .decision import CHOICE, NOUL, SCORE, Decision
 from .decompose import decompose
 from .effort import Effort
 from .effort import effort as _resolve_effort
@@ -321,6 +322,7 @@ class LoopEngine:
         self._extra_temp: dict[str, float] = {}       # step id → added temperature (rises each repair)
         self._repair_history: list[tuple[str, str]] = []  # (culprit id, error signature) already tried —
         #                                                   feeds repair-progress routing (loop/decide.py)
+        self._decisions: list[Decision] = []          # the run's bounded forks, logged into evidence
         # Parallel step execution: independent ready steps (distinct files, no dep path between them)
         # run concurrently. Default 1 (sequential, unchanged). It's real work overlap — the model
         # calls are blocking HTTP so threads release the GIL — but the actual speedup depends on the
@@ -349,6 +351,7 @@ class LoopEngine:
         return summarize
 
     def run(self, goal: str, *, resume: bool = False) -> LoopResult:
+        self._decisions = []                           # fresh audit trail of bounded forks per run
         state = self._load_or_plan(goal, resume)
         if state is None:
             return LoopResult(False, "could not decompose the goal into steps")
@@ -470,6 +473,7 @@ class LoopEngine:
                 "The test run collected NO tests. pytest only runs functions named `test_*` — the "
                 "file has bare module-level asserts instead. Rewrite it so every assertion lives "
                 "inside a `def test_...():` function, then it will run.")
+            culprit_conf, culprit_why = 0.95, "the test file defines no def test_* functions"
         else:
             culprit = self._culprit_step(failed.result, state)
             if culprit is None:
@@ -482,6 +486,12 @@ class LoopEngine:
                                   f"keeping their interface.")
                 msg += "\n\n" + blast
             self._pending_error[culprit.id] = msg
+            # Structural confidence in the culprit pick: high when the failure names the file directly,
+            # lower when it was inferred (e.g. via the test's imports). Coarse, but honest and auditable.
+            base = (culprit.file or "").replace("\\", "/").rsplit("/", 1)[-1]
+            named = bool(base) and base in (failed.result or "")
+            culprit_conf, culprit_why = ((0.9, "named directly in the failure") if named
+                                         else (0.5, "inferred (not named directly in the failure)"))
         # --- Confidence routing (the local, honest "decision + confidence"): don't keep spending
         # repairs on a fix that isn't working. If we have ALREADY tried to fix THIS file for THIS same
         # error and it came back unchanged, another repair (even a hotter best-of-N candidate) has low
@@ -497,9 +507,18 @@ class LoopEngine:
                               f"same error persists after a fix. Escalating (re-plan) instead of "
                               f"re-fixing it again.")
             state.log.append(f"repair-stalled {culprit.id}: {sig[:80]}")
+            self._decisions.append(Decision(
+                name="repair_progress", kind=NOUL,
+                question="Is another repair on this file likely to help?",
+                answer="no — escalate", confidence=1.0,
+                reason=f"the same error recurred on {culprit.file or culprit.id} after a fix"))
             state.save(self.checkpoint_path)
             return False
         self._repair_history.append((culprit.id, sig))
+        self._decisions.append(Decision(
+            name="repair_culprit", kind=CHOICE,
+            question="Which file should be fixed for this failure?",
+            answer=culprit.file or culprit.id, confidence=culprit_conf, reason=culprit_why))
         culprit.status = PENDING
         culprit.result = ""
         # Each repair explores a MORE different fix (best-of-N over cycles), not the same broken one.
@@ -870,10 +889,15 @@ class LoopEngine:
                   f"of {len(state.steps)} steps.")
         vd = self._run_verdict(state)
         self.emit("verdict", {"level": vd.level, "label": vd.label, "reason": vd.reason})
-        # Evidence-binding: attach what the run PROVED — the checks that ran (tests, route probe) and
-        # a content fingerprint of every produced file — so the verdict is trustworthy without a
-        # re-run. Emitted for the live view and returned on the result for the History log.
-        ev = collect_evidence(state, self.root)
+        self._decisions.append(Decision(
+            name="verdict", kind=SCORE,
+            question="Is the finished build trustworthy?",
+            answer=vd.label, confidence=1.0, reason=vd.reason))
+        # Evidence-binding: attach what the run PROVED — the checks that ran (tests, route probe), a
+        # content fingerprint of every produced file, AND the bounded DECISIONS the loop took (each
+        # with its confidence + reason — the "keep the probabilities" discipline) — so the verdict is
+        # trustworthy and auditable without a re-run. Emitted live and returned for the History log.
+        ev = collect_evidence(state, self.root, self._decisions)
         self.emit("evidence", ev.as_dict())
         proof = f" · proof: {ev.checks_passed}/{len(ev.checks)} checks, {len(ev.artifacts)} files"
         answer = f"[{vd.label}] {counts} — {vd.reason}{proof if ev.checks or ev.artifacts else ''}"

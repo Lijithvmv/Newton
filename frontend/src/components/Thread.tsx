@@ -135,6 +135,7 @@ function Item({ it, status }: { it: ThreadItem; status: Record<string, TaskStatu
             <b>Evidence</b>
             <span className="evsum">
               {ev.checks.filter((c) => c.passed).length}/{ev.checks.length} checks · {ev.artifacts.length} files
+              {ev.decisions && ev.decisions.length > 0 ? ` · ${ev.decisions.length} decisions` : ""}
               {ev.verified ? " · verified" : " · unverified"}
             </span>
           </div>
@@ -156,6 +157,22 @@ function Item({ it, status }: { it: ThreadItem; status: Record<string, TaskStatu
                   <span className="evfile">{a.file}</span>
                   <span className="evhash">{a.sha256.slice(0, 10)}</span>
                   <span className="evbytes">{a.bytes} B</span>
+                </li>
+              ))}
+            </ul>
+          )}
+          {ev.decisions && ev.decisions.length > 0 && (
+            <ul className="evdecisions">
+              {ev.decisions.map((d, i) => (
+                <li key={i}>
+                  <span className="evdname">{d.name.replace(/_/g, " ")}</span>
+                  <span className="evdanswer">{d.answer}</span>
+                  <span
+                    className={`evdconf ${d.confidence >= 0.8 ? "hi" : d.confidence >= 0.5 ? "mid" : "lo"}`}
+                    title={`${d.decider} · ${d.reason}`}
+                  >
+                    {Math.round(d.confidence * 100)}%
+                  </span>
                 </li>
               ))}
             </ul>

@@ -81,3 +81,57 @@ def test_report_computes_agreement_from_rows(capsys):
     assert abs(out["agreement"] - 2 / 3) < 1e-9
     assert out["recall"] == 0.5                          # 1 of 2 real failures caught
     assert "agreement" in capsys.readouterr().out
+
+
+class _FlakyCheckExec(_OkExec):
+    """The check fails on its first attempt, then passes — the intermediate failure a finalize-only
+    corpus would never see (survivorship bias)."""
+    def __init__(self, root):
+        super().__init__(root)
+        self.runs = 0
+    def execute(self, step, context, *, temperature: float = 0.1, **kw):
+        if step.kind == RUN:
+            self.runs += 1
+            return (StepResult(False, "=== 1 FAILED, 2 passed ===") if self.runs == 1
+                    else StepResult(True, "3 passed"))
+        return super().execute(step, context, temperature=temperature)
+
+
+def test_collector_captures_intermediate_failures(tmp_path, monkeypatch):
+    monkeypatch.setenv("NEWTON_LOOP_SELFTEST", "0")
+    monkeypatch.setenv("NEWTON_LOOP_INTEGRATION", "0")
+    monkeypatch.setattr("newton.loop.engine.decompose", lambda *a, **k: _plan())
+    retry = Effort("test", max_attempts=2, repair_cycles=0, replan_cycles=0,
+                   best_of_n=1, retrieval_k=3, budget_chars=6000)
+    eng = LoopEngine(load_settings(tmp_path), executor=_FlakyCheckExec(tmp_path), effort=retry,
+                     judge=_FakeJudge())
+    assert eng.run("build").ok
+    rows = read_advisory(tmp_path / ".newton" / "advisory.jsonl")
+    assert [r["truth_failure"] for r in rows] == [True, False]   # the failed attempt is in the corpus
+    assert all(r["correct"] for r in rows)
+    assert len({r["run_id"] for r in rows}) == 1 and rows[0]["command"] == "pytest"
+
+
+def test_collector_dedupes_and_never_blocks(tmp_path):
+    import threading
+    import time
+
+    from newton.loop.advisory_collector import AdvisoryCollector
+
+    gate = threading.Event()
+
+    class _SlowJudge(_FakeJudge):
+        def judge_failure(self, text):
+            gate.wait(5)                                  # simulate ~0.5s Laya inference
+            return super().judge_failure(text)
+
+    c = AdvisoryCollector(_SlowJudge(), tmp_path / "a.jsonl")
+    t0 = time.perf_counter()
+    assert c.record("r", 1, "pytest", "1 FAILED", False) is True
+    assert c.record("r", 2, "pytest", "1 FAILED", False) is False   # identical output -> skipped
+    assert c.record("r", 3, "pytest", "3 passed", True) is True
+    assert time.perf_counter() - t0 < 0.05                # hot path didn't wait on the judge
+    gate.set()
+    c.shutdown()
+    assert len(read_advisory(tmp_path / "a.jsonl")) == 2
+    assert not c._worker.is_alive()

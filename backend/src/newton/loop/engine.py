@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 import threading
+import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -33,7 +34,7 @@ from .effort import Effort
 from .effort import effort as _resolve_effort
 from .evidence import Evidence, collect_evidence
 from .execute import NativeStepExecutor, StepExecutor, StepResult
-from .judge import LayaJudge, append_advisory
+from .judge import LayaJudge
 from .state import BLOCKED, DONE, FAILED, PENDING, RUN, RUNNING, WRITE, LoopState, Step
 
 # The historical caps, kept as the definition of the `normal` effort level (see loop/effort.py).
@@ -307,6 +308,11 @@ class LoopEngine:
         self.root = Path(settings.project_root)
         self.emit = emit or (lambda *a: None)
         self._judge = judge                            # optional advisory judge (Laya); injected in tests
+        # Advisory collector (opt-in, eval-first): captures INTERMEDIATE check outcomes into the corpus
+        # off the hot path. Built per run (in run()) only when a judge is injected or advisory judging
+        # is enabled, so the heavy deps stay unloaded otherwise. See loop/advisory_collector.py.
+        self._collector = None
+        self._run_id = ""
         # How much free local compute this run may spend to reach verified quality. `normal` == the
         # historical constants, so the default is a no-op; higher levels push the SAME model harder
         # (more attempts / wider retrieval / more replans), the lever that only free-token, unlimited-
@@ -355,6 +361,19 @@ class LoopEngine:
 
     def run(self, goal: str, *, resume: bool = False) -> LoopResult:
         self._decisions = []                           # fresh audit trail of bounded forks per run
+        self._run_id = uuid.uuid4().hex[:8]            # tag advisory rows to this run
+        self._collector = None
+        if self._judge is not None or os.getenv("NEWTON_LOOP_ADVISORY_JUDGE", "0") == "1":
+            from .advisory_collector import AdvisoryCollector
+            self._collector = AdvisoryCollector(
+                self._judge or LayaJudge(), self.root / ".newton" / "advisory.jsonl")
+        try:
+            return self._run(goal, resume)
+        finally:
+            if self._collector is not None:            # flush the advisory corpus, then stop the worker
+                self._collector.shutdown()
+
+    def _run(self, goal: str, resume: bool) -> LoopResult:
         state = self._load_or_plan(goal, resume)
         if state is None:
             return LoopResult(False, "could not decompose the goal into steps")
@@ -446,8 +465,10 @@ class LoopEngine:
             if res.ok:
                 v = self._verify(step)
                 if v.ok:
+                    self._advise(step, res)
                     break
                 res = StepResult(False, v.detail)
+            self._advise(step, res)
             error = res.detail
 
         step.status = DONE if res.ok else FAILED
@@ -896,7 +917,9 @@ class LoopEngine:
             name="verdict", kind=SCORE,
             question="Is the finished build trustworthy?",
             answer=vd.label, confidence=1.0, reason=vd.reason))
-        self._advisory_judge(state)                    # opt-in: Laya scores checks alongside truth (no-op otherwise)
+        if self._collector is not None:                # opt-in: wait for the background Laya judgments
+            self._collector.drain()                    # (the loop is done, so this never slows repair)
+            self._decisions.extend(self._collector.decisions)
         # Evidence-binding: attach what the run PROVED — the checks that ran (tests, route probe), a
         # content fingerprint of every produced file, AND the bounded DECISIONS the loop took (each
         # with its confidence + reason — the "keep the probabilities" discipline) — so the verdict is
@@ -908,37 +931,19 @@ class LoopEngine:
         self.emit("loop", {"ok": ok, "answer": answer, "counts": c})
         return LoopResult(ok, answer, state, evidence=ev)
 
-    def _advisory_judge(self, state: LoopState) -> None:
-        """Eval-first (never acts): score each check's output with the advisory Laya judge and record
-        its answer as a Decision ALONGSIDE the deterministic ground truth, appending the pair to the
-        advisory log. This is the doc's safe placement — it changes nothing the loop does; over real
-        runs the log becomes a labeled corpus to measure Laya's agreement/drift on Newton's own
-        outputs. Off by default; enable with NEWTON_LOOP_ADVISORY_JUDGE=1 (or inject a judge in tests).
-        Fully fail-soft — an advisory error never touches the run's result."""
-        judge = self._judge
-        if judge is None:
-            if os.getenv("NEWTON_LOOP_ADVISORY_JUDGE", "0") != "1":
-                return
-            judge = LayaJudge()
+    def _advise(self, step: Step, res: StepResult) -> None:
+        """Eval-first (never acts): hand every INTERMEDIATE check attempt to the background collector,
+        labeled with Newton's deterministic verdict. Capturing each attempt — not just the finalize
+        survivor — is what gives the corpus real failures (finalize is nearly all 'ok'). Non-blocking
+        (<0.05ms); Laya judges out of band. Off unless NEWTON_LOOP_ADVISORY_JUDGE=1 or a judge is
+        injected. Fully fail-soft — an advisory error never touches the run."""
+        if self._collector is None or step.kind != RUN:
+            return
         try:
-            log_path = self.root / ".newton" / "advisory.jsonl"
-            for s in state.steps:
-                if s.kind != RUN or not s.result:
-                    continue
-                d = judge.judge_failure(s.result)
-                if d is None:
-                    continue
-                truth_failure = s.status != DONE           # ground truth: did the check actually fail?
-                pred_failure = d.answer == "failure"
-                p_failure = d.confidence if pred_failure else 1.0 - d.confidence
-                d.reason += f" | truth={'failure' if truth_failure else 'ok'}"
-                self._decisions.append(d)
-                append_advisory(log_path, {
-                    "check": s.id, "truth_failure": truth_failure, "pred_failure": pred_failure,
-                    "p_failure": round(p_failure, 4), "confidence": d.confidence,
-                    "correct": pred_failure == truth_failure})
+            self._collector.record(self._run_id, step.attempts, step.command or step.id,
+                                   res.detail, res.ok)
         except Exception:
-            pass                                           # advisory must never break a run
+            pass
 
     def _load_or_plan(self, goal: str, resume: bool) -> LoopState | None:
         if resume and self.checkpoint_path.is_file():

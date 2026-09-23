@@ -19,6 +19,7 @@ from ..conductor.pipeline import Conductor
 from ..conductor.state import extract_code
 from ..config import load_settings
 from ..llm import complete
+from ..proc import run_shell
 from .tasks import SEED_TASKS, EvalTask
 
 BASELINE_SYSTEM = (
@@ -62,7 +63,7 @@ def _run_check(root: Path, check: str) -> bool:
     """Run the task's objective checker in the sandbox. Exit 0 == the task succeeded."""
     cmd = check.replace("{py}", f'"{sys.executable}"')
     try:
-        r = subprocess.run(cmd, shell=True, cwd=root, capture_output=True, text=True, timeout=120)
+        r = run_shell(cmd, cwd=root, timeout=120)
     except subprocess.TimeoutExpired:
         return False
     return r.returncode == 0

@@ -19,6 +19,7 @@ from typing import Protocol
 
 from ..conductor.state import extract_code
 from ..llm import complete
+from ..proc import run_shell
 from .output_check import error_shaped
 from .state import RUN, Step
 
@@ -80,8 +81,7 @@ class NativeStepExecutor:
             return StepResult(False, "run step has no command")
         cmd = step.command.replace("{py}", f'"{sys.executable}"')
         try:
-            r = subprocess.run(cmd, shell=True, cwd=self.root, capture_output=True,
-                               text=True, timeout=self.timeout)
+            r = run_shell(cmd, cwd=self.root, timeout=self.timeout)
         except subprocess.TimeoutExpired:
             return StepResult(False, f"command timed out: {step.command}")
         out = ((r.stdout or "") + (r.stderr or "")).strip()

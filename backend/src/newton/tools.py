@@ -16,6 +16,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from .proc import run_shell
+
 # Actions that change the world or run code. The loop asks before executing these.
 MUTATING = {"write_file", "edit_file", "run"}
 
@@ -173,9 +175,7 @@ class ToolBelt:
         if not cmd:
             raise ToolError("cmd is required")
         try:
-            proc = subprocess.run(
-                cmd, shell=True, cwd=self.root, capture_output=True, text=True, timeout=180,
-            )
+            proc = run_shell(cmd, cwd=self.root, timeout=180)
         except subprocess.TimeoutExpired:
             return "[command timed out after 180s]"
         out = (proc.stdout or "") + (proc.stderr or "")

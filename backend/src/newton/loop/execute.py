@@ -11,6 +11,7 @@ spike proved runs atomic steps on Ollama) can drop in without changing the loop.
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -79,7 +80,7 @@ class NativeStepExecutor:
     def _run(self, step: Step) -> StepResult:
         if not step.command:
             return StepResult(False, "run step has no command")
-        cmd = step.command.replace("{py}", f'"{sys.executable}"')
+        cmd = _normalize_command(step.command).replace("{py}", f'"{sys.executable}"')
         try:
             r = run_shell(cmd, cwd=self.root, timeout=self.timeout)
         except subprocess.TimeoutExpired:
@@ -101,6 +102,27 @@ class NativeStepExecutor:
             return StepResult(False, f"NO_TESTS_COLLECTED (pytest exit 5): the test file defines no "
                                      f"`def test_*` functions, so pytest ran nothing. {out[:200]}")
         return StepResult(False, f"command failed (exit {r.returncode}): {_extract_failure(out)}")
+
+
+_BARE_PY = re.compile(r"^\s*(pytest|python3|python)\b(.*)$", re.DOTALL)
+
+
+def _normalize_command(command: str) -> str:
+    """Rewrite a leading BARE Python/pytest invocation to the `{py}` convention.
+
+    The decompose prompt asks for `{py} -m pytest`, but the weak local model sometimes emits a plain
+    `pytest ...` or `python ...`; on Windows that shell command is 'not recognized' (pytest/python
+    aren't on PATH) and the check falsely FAILS — a real build gets marked broken and burns repair
+    cycles. The system owns the plan, so it deterministically fixes what the model got wrong (like the
+    import-repair): map the leading executable to `{py}` (the resolved interpreter, which has pytest).
+    Commands already using `{py}`, an absolute/quoted interpreter, or a non-Python tool are untouched."""
+    if "{py}" in command:
+        return command
+    m = _BARE_PY.match(command)
+    if not m:
+        return command
+    exe, rest = m.group(1), m.group(2)
+    return ("{py} -m pytest" if exe == "pytest" else "{py}") + rest
 
 
 def _extract_failure(out: str, limit: int = 500) -> str:

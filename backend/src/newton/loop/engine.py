@@ -155,18 +155,11 @@ class ContextShaper:
     """
 
     def __init__(self, root: Path, *, budget_chars: int = 6000, per_file: int = 1800,
-                 summarize: Callable[[str, int], str] | None = None,
-                 compactor: str | None = None) -> None:
+                 summarize: Callable[[str, int], str] | None = None) -> None:
         self.root = Path(root)
         self.budget_chars = budget_chars
         self.per_file = per_file
         self.summarize = summarize          # (text, max_chars) -> compacted text; None = clip
-        # How overflowing reference context is fitted: "summarize" (model rewrites it — the historical
-        # default) or "mechanical" (skeleton + truncation, never rewrites; loop/compact.py). Kept
-        # switchable so the two can be A/B'd on the eval suite before either is trusted as default.
-        self.compactor = compactor or os.getenv("NEWTON_LOOP_COMPACTOR", "summarize")
-        self.stats = {"shapes": 0, "compactions": 0, "ref_chars_in": 0, "ref_chars_out": 0}
-        self._stats_lock = threading.Lock()
 
     def _read(self, rel: str) -> str:
         p = self.root / rel
@@ -194,25 +187,13 @@ class ContextShaper:
     def shape(self, state: LoopState, step: Step, *, error: str | None = None) -> str:
         tagged = self.parts(state, step, error=error)
         head = "\n\n".join(t for p, t in tagged if p)
-        ref_parts = [t for p, t in tagged if not p]
-        ref = "\n\n".join(ref_parts)
-        with self._stats_lock:
-            self.stats["shapes"] += 1
+        ref = "\n\n".join(t for p, t in tagged if not p)
         if not ref:
             return head[: self.budget_chars]
         if len(head) + len(ref) + 2 <= self.budget_chars:
             return f"{head}\n\n{ref}"
         room = max(self.budget_chars - len(head) - 4, 600)      # leave the priority head intact
-        if self.compactor == "mechanical":
-            from .compact import mechanical_compact
-            out = mechanical_compact(ref_parts, room)
-        else:
-            out = self._compact(ref, room)
-        with self._stats_lock:
-            self.stats["compactions"] += 1
-            self.stats["ref_chars_in"] += len(ref)
-            self.stats["ref_chars_out"] += len(out)
-        return f"{head}\n\n{out}"[: self.budget_chars]
+        return f"{head}\n\n{self._compact(ref, room)}"[: self.budget_chars]
 
     def _compact(self, text: str, room: int) -> str:
         """Fit reference context into `room` chars — SUMMARISE it if a summarizer is wired, else

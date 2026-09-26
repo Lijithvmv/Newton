@@ -98,7 +98,8 @@ class LayaDecider:
                 "backend venv with `pip install laya` (~808MB weights, CPU-capable). Newton itself "
                 "never requires it."
             ) from e
-        self._agent = laya.load(model)
+        from ..loop.judge import resolve_laya_path  # same pinned weights the judge uses
+        self._agent = laya.load(resolve_laya_path(model))
 
     def predict(self, text: str) -> Pred:
         q = {"failed": {"type": "noul", "instructions": NOUL_INSTRUCTIONS}}

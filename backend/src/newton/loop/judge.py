@@ -32,6 +32,30 @@ _FAILURE_Q = (
 )
 
 
+# Laya is PINNED to one exact revision. An unpinned `laya.load("convaiinnovations/laya")` re-resolves
+# "main" on the Hugging Face Hub on every load: a network call carrying your IP + the model name, and
+# weights that can change underneath a measured baseline (the cache already held two different
+# snapshots). Resolving a fixed revision from the local cache means repeat loads touch NO network and
+# always use the weights the validation measured. Bump deliberately, then re-run the validation.
+LAYA_REPO = "convaiinnovations/laya"
+LAYA_REVISION = os.getenv("NEWTON_LAYA_REVISION", "5e7b2b1b8ca2ecdd3f2322d94069c9b6ce7e844b")
+_LAYA_FILES = ["encoder/*", "model.safetensors", "rl_agent_config.json", "tokenizer/*"]
+
+
+def resolve_laya_path(model: str = LAYA_REPO, revision: str = LAYA_REVISION) -> str:
+    """Local directory of the pinned Laya checkpoint. Cached -> resolved fully offline (no Hub call).
+    Not cached yet (first run on this machine) -> fetch exactly that revision's files, once. A local
+    directory passed as `model` is used as-is."""
+    if os.path.isdir(model):
+        return model
+    from huggingface_hub import snapshot_download
+    try:
+        return snapshot_download(model, revision=revision, allow_patterns=_LAYA_FILES,
+                                 local_files_only=True)
+    except Exception:
+        return snapshot_download(model, revision=revision, allow_patterns=_LAYA_FILES)
+
+
 class LayaJudge:
     """A process-wide Laya judge that loads the model in the BACKGROUND and never blocks a run.
 
@@ -64,12 +88,12 @@ class LayaJudge:
             # Load-time fixes (measured: >180s hang -> ~16s CPU). The real one is laya >= 0.3.7 —
             # < 0.3.7 deadlocks on newer Windows Python. These flags are cheap, safe defaults an
             # operator can override: skip the TF runtime probe (we have no TensorFlow), and disable
-            # oneDNN. HF_HUB_OFFLINE is deliberately NOT forced — the first load must be able to
-            # download the weights; set it yourself to skip HF network probes on repeat loads.
+            # oneDNN. The checkpoint is resolved from a PINNED revision (resolve_laya_path), so repeat
+            # loads never contact the Hub; only a machine's very first load fetches that exact revision.
             os.environ.setdefault("USE_TF", "0")
             os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
             import laya  # type: ignore   (needs laya >= 0.3.7; 0.3.10+ recommended)
-            agent = laya.load(self.model)
+            agent = laya.load(resolve_laya_path(self.model))
             with LayaJudge._lock:
                 LayaJudge._agent = agent
         except Exception as e:                        # ImportError or a load/runtime failure

@@ -1,0 +1,86 @@
+<svg viewBox="0 0 1280 640" xmlns="http://www.w3.org/2000/svg" font-family="'Segoe UI',system-ui,-apple-system,Helvetica,Arial,sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#120b04"/>
+      <stop offset="0.55" stop-color="#181007"/>
+      <stop offset="1" stop-color="#100a04"/>
+    </linearGradient>
+    <linearGradient id="acc" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#fbbf24"/>
+      <stop offset="1" stop-color="#f59e0b"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#f59e0b" stop-opacity="0.34"/>
+      <stop offset="1" stop-color="#f59e0b" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="core" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#fde68a"/>
+      <stop offset="1" stop-color="#f59e0b"/>
+    </radialGradient>
+    <pattern id="dots" width="26" height="26" patternUnits="userSpaceOnUse">
+      <circle cx="1.5" cy="1.5" r="1.5" fill="#3a2a10"/>
+    </pattern>
+  </defs>
+
+  <rect width="1280" height="640" fill="url(#bg)"/>
+  <rect width="1280" height="640" fill="url(#dots)" opacity="0.5"/>
+  <circle cx="1020" cy="320" r="360" fill="url(#glow)"/>
+  <rect x="0" y="0" width="8" height="640" fill="url(#acc)"/>
+
+  <!-- right motif: orbits around a local core -->
+  <g transform="translate(1020,320)">
+    <g fill="none" stroke="#6b4e17" stroke-width="2">
+      <ellipse rx="185" ry="88" transform="rotate(-24)"/>
+      <ellipse rx="150" ry="150" stroke="#553d10"/>
+      <ellipse rx="185" ry="88" transform="rotate(30)"/>
+    </g>
+    <circle r="42" fill="url(#core)"/>
+    <text x="0" y="8" font-size="22" font-weight="800" fill="#3a2600" text-anchor="middle">LLM</text>
+    <g fill="#fcd34d">
+      <circle cx="169" cy="-75" r="9"/>
+      <circle cx="-150" cy="0" r="8"/>
+      <circle cx="160" cy="92" r="9"/>
+      <circle cx="-95" cy="-130" r="7"/>
+    </g>
+  </g>
+
+  <!-- wordmark -->
+  <g transform="translate(96,150)">
+    <rect x="0" y="-34" width="196" height="30" rx="6" fill="#241905" stroke="#5a4110"/>
+    <text x="16" y="-13" font-size="15" letter-spacing="2" font-weight="600" fill="#fbbf24">LOCAL · OFFLINE · AGENT</text>
+
+    <text x="0" y="78" font-size="92" font-weight="800" fill="#fffaf0" letter-spacing="-1">Newton</text>
+    <text x="2" y="132" font-size="30" font-weight="600" fill="#fde3a7">A fully-local coding &amp; project agent.</text>
+
+    <text x="2" y="182" font-size="21" fill="#d9b876">Claude-Code-style, running entirely on a local LLM via Ollama —</text>
+    <text x="2" y="212" font-size="21" fill="#d9b876">no cloud in the loop, no data leaving your machine.</text>
+
+    <g font-size="16" font-weight="600" fill="#fbe7bf">
+      <g transform="translate(0,262)">
+        <rect x="0" y="0" width="182" height="38" rx="19" fill="#241905" stroke="#5a4110"/>
+        <text x="20" y="25">Local LLM · Ollama</text>
+      </g>
+      <g transform="translate(194,262)">
+        <rect x="0" y="0" width="196" height="38" rx="19" fill="#241905" stroke="#5a4110"/>
+        <text x="20" y="25">Harness engineering</text>
+      </g>
+      <g transform="translate(402,262)">
+        <rect x="0" y="0" width="158" height="38" rx="19" fill="#241905" stroke="#5a4110"/>
+        <text x="20" y="25">Plan · Edit · Verify</text>
+      </g>
+      <g transform="translate(0,310)">
+        <rect x="0" y="0" width="128" height="38" rx="19" fill="#241905" stroke="#5a4110"/>
+        <text x="20" y="25">Offline-first</text>
+      </g>
+      <g transform="translate(140,310)">
+        <rect x="0" y="0" width="112" height="38" rx="19" fill="#241905" stroke="#5a4110"/>
+        <text x="20" y="25">Zero cloud</text>
+      </g>
+    </g>
+  </g>
+
+  <g transform="translate(96,600)" font-size="17" fill="#8a6c3a">
+    <text x="0" y="0">github.com/Lijithvmv/Newton</text>
+    <text x="1184" y="0" text-anchor="end" fill="#75592f">Python  ·  runs on your machine</text>
+  </g>
+</svg>

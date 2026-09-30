@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/banner.svg" alt="Newton — a fully-local coding & project agent" width="100%">
+</p>
+
 # Newton
 
 ![CI](https://github.com/Lijithvmv/newton/actions/workflows/ci.yml/badge.svg)

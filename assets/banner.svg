@@ -46,7 +46,7 @@
 
   <!-- wordmark -->
   <g transform="translate(96,150)">
-    <rect x="0" y="-34" width="196" height="30" rx="6" fill="#241905" stroke="#5a4110"/>
+    <rect x="0" y="-34" width="232" height="30" rx="6" fill="#241905" stroke="#5a4110"/>
     <text x="16" y="-13" font-size="15" letter-spacing="2" font-weight="600" fill="#fbbf24">LOCAL · OFFLINE · AGENT</text>
 
     <text x="0" y="78" font-size="92" font-weight="800" fill="#fffaf0" letter-spacing="-1">Newton</text>
@@ -81,6 +81,6 @@
 
   <g transform="translate(96,600)" font-size="17" fill="#8a6c3a">
     <text x="0" y="0">github.com/Lijithvmv/Newton</text>
-    <text x="1184" y="0" text-anchor="end" fill="#75592f">Python  ·  runs on your machine</text>
+    <text x="1088" y="0" text-anchor="end" fill="#75592f">Python  ·  runs on your machine</text>
   </g>
 </svg>

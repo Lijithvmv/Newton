@@ -78,11 +78,16 @@ class NativeStepExecutor:
         return StepResult(True, f"wrote {step.file} ({len(code)} chars)")
 
     def _run(self, step: Step) -> StepResult:
+        return self.run_in(step, self.root)
+
+    def run_in(self, step: Step, root: Path) -> StepResult:
+        """Run a RUN step's command with `root` as the working directory (the project, or a baseline
+        snapshot when validating that a check could have failed — see loop/baseline.py)."""
         if not step.command:
             return StepResult(False, "run step has no command")
         cmd = _normalize_command(step.command).replace("{py}", f'"{sys.executable}"')
         try:
-            r = run_shell(cmd, cwd=self.root, timeout=self.timeout)
+            r = run_shell(cmd, cwd=root, timeout=self.timeout)
         except subprocess.TimeoutExpired:
             return StepResult(False, f"command timed out: {step.command}")
         out = ((r.stdout or "") + (r.stderr or "")).strip()

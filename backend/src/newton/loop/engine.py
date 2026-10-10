@@ -367,6 +367,17 @@ class LoopEngine:
             from .advisory_collector import AdvisoryCollector
             self._collector = AdvisoryCollector(
                 self._judge or LayaJudge(), self.root / ".newton" / "advisory.jsonl")
+        # Baseline-replay check validation (opt-in until measured): snapshot the project before the run
+        # changes it, so every passing check can be re-run on the pre-change code. See loop/baseline.py.
+        self._baseline: Path | None = None
+        self._vacuous: set[str] = set()
+        if os.getenv("NEWTON_LOOP_BASELINE_CHECK", "0") == "1":
+            from .baseline import snapshot
+            dest = self.root / ".newton" / "baseline"
+            try:
+                self._baseline = dest if (resume and dest.is_dir()) else snapshot(self.root, dest)
+            except OSError:
+                self._baseline = None
         try:
             return self._run(goal, resume)
         finally:
@@ -466,6 +477,7 @@ class LoopEngine:
                 v = self._verify(step)
                 if v.ok:
                     self._advise(step, res)
+                    self._check_baseline(step)
                     break
                 res = StepResult(False, v.detail)
             self._advise(step, res)
@@ -477,6 +489,23 @@ class LoopEngine:
             state.log.append(f"{step.id} {step.status}: {step.result}")
             state.save(self.checkpoint_path)          # checkpoint after EVERY step → resumable
         self.emit("step", {"id": step.id, "status": step.status, "detail": step.result})
+
+    def _check_baseline(self, step: Step) -> None:
+        """After a check passes: would it also pass on the code before the change? If so it's vacuous —
+        it can't support a verified verdict. Re-evaluated on every pass, so a check repaired into a real
+        one stops counting as vacuous. Opt-in; a no-op unless a baseline snapshot exists."""
+        if step.kind != RUN or getattr(self, "_baseline", None) is None:
+            return
+        from .baseline import passes_on_baseline
+        vacuous = passes_on_baseline(self.executor, step, self.root, self._baseline)
+        with self._state_lock:
+            if vacuous:
+                self._vacuous.add(step.id)
+            else:
+                self._vacuous.discard(step.id)
+        if vacuous:
+            self.emit("note", f"Check `{step.command}` also passes on the code before the change — "
+                              f"it doesn't test the change.")
 
     def _repair_from_test_failure(self, state: LoopState) -> bool:
         """A failed RUN step (a check/tests) means the CODE is wrong, not the command — retrying the
@@ -900,7 +929,17 @@ class LoopEngine:
                             if not d.rsplit("/", 1)[-1].startswith("test_")]
                     if deps:
                         fwd.append((s.file, deps))
-        return review_run(failed, fwd)
+        vd = review_run(failed, fwd)
+        self._verdict_without_baseline = vd
+        if getattr(self, "_baseline", None) is not None and vd.level != "block":
+            # A verified verdict needs at least one passing check that could have failed.
+            passed = [s for s in state.steps if s.kind == RUN and s.status == DONE]
+            if passed and all(s.id in self._vacuous for s in passed):
+                from .verdict import BLOCK, Verdict
+                cmds = ", ".join(f"`{s.command}`" for s in passed[:3])
+                vd = Verdict(BLOCK, f"unverified: every passing check ({cmds}) also passes on the code "
+                                    f"before the change, so none of them tests it")
+        return vd
 
     def _finalize(self, state: LoopState) -> LoopResult:
         for s in state.steps:                          # anything left had a failed/blocked dependency
@@ -913,6 +952,10 @@ class LoopEngine:
                   f"of {len(state.steps)} steps.")
         vd = self._run_verdict(state)
         self.emit("verdict", {"level": vd.level, "label": vd.label, "reason": vd.reason})
+        if getattr(self, "_baseline", None) is not None:   # both verdicts from one run → paired measurement
+            base = self._verdict_without_baseline
+            self.emit("baseline", {"vacuous": sorted(self._vacuous), "label_without": base.label,
+                                   "label_with": vd.label})
         self._decisions.append(Decision(
             name="verdict", kind=SCORE,
             question="Is the finished build trustworthy?",

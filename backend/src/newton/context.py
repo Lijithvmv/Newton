@@ -39,7 +39,9 @@ def load_context(root: Path, context_file: str) -> str:
 
 def project_tree(root: Path, max_entries: int = 60) -> str:
     """A shallow file listing so the agent knows the lay of the land without a tool call."""
-    skip = {".venv", "node_modules", "__pycache__", ".git", "vendor", ".pytest_cache"}
+    # `.newton/` is Newton's own runtime state (checkpoint, index, run logs) — never project content.
+    # Listing it fed the model noise and, since it sorts first, could push real files past the cap.
+    skip = {".venv", "node_modules", "__pycache__", ".git", "vendor", ".pytest_cache", ".newton"}
     lines: list[str] = []
     for p in sorted(root.rglob("*")):
         if any(part in skip for part in p.relative_to(root).parts):

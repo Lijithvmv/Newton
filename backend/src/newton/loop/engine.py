@@ -554,6 +554,23 @@ class LoopEngine:
         state.save(self.checkpoint_path)
         return True
 
+    @staticmethod
+    def _is_test_file(rel: str) -> bool:
+        base = rel.replace("\\", "/").rsplit("/", 1)[-1]
+        return base.endswith(".py") and (base.startswith("test_") or base.endswith("_test.py"))
+
+    def _has_real_test(self, state: LoopState) -> bool:
+        """A test pytest would actually collect: the plan writes one, or the project already has one.
+        A bare script run is not a test, and `pytest` alone tests nothing without a test file."""
+        if any(s.kind != RUN and self._is_test_file(s.file) for s in state.steps):
+            return True
+        skip = {".newton", ".venv", "venv", "node_modules", "__pycache__", ".git", ".pytest_cache"}
+        for p in self.root.rglob("*.py"):
+            rel = p.relative_to(self.root)
+            if not any(part in skip for part in rel.parts) and self._is_test_file(str(rel)):
+                return True
+        return False
+
     def _test_step(self, state: LoopState) -> Step | None:
         """The WRITE step for a test file (`test_*.py`) — what to fix when a check collected no tests."""
         for s in state.steps:
@@ -692,7 +709,14 @@ class LoopEngine:
         NEWTON_LOOP_SELFTEST=0."""
         if os.getenv("NEWTON_LOOP_SELFTEST", "1") == "0":
             return
-        if any(s.kind == RUN for s in state.steps):
+        if os.getenv("NEWTON_LOOP_REAL_CHECK", "0") == "1":
+            # Trust the plan's check only if a REAL test exists. Measured 2026-10-11 (54 runs, 2 models):
+            # all 8 wrong verdicts came from planned checks that couldn't test the goal — a bare
+            # `python greet.py` (can't fail → false PASS) or `pytest` with no test written (can't pass
+            # → false FAIL). Opt-in until measured.
+            if self._has_real_test(state):
+                return
+        elif any(s.kind == RUN for s in state.steps):
             return                                   # the model already planned a check — trust it
         code = [s for s in state.steps if s.kind != RUN and s.file.endswith(".py")
                 and not s.file.rsplit("/", 1)[-1].startswith("test_") and s.status == DONE]

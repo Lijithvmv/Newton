@@ -228,7 +228,11 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def main():
     port = _free_port()
-    proc = subprocess.Popen([sys.executable, "app.py", "--port", str(port)])
+    # Own process group so the WHOLE tree can be killed: on Windows a venv python.exe is a launcher
+    # that starts the real interpreter as a child, so killing only `proc` left servers running.
+    group = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32"
+             else {"start_new_session": True})
+    proc = subprocess.Popen([sys.executable, "app.py", "--port", str(port)], **group)
     base = "http://127.0.0.1:%d" % port
     try:
         up = False
@@ -281,11 +285,27 @@ def main():
         print("OK")
         return 0
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except Exception:
-            proc.kill()
+        _kill_tree(proc)
+
+
+def _kill_tree(proc):
+    """Stop the server AND everything it started (generated apps may bind 0.0.0.0; an orphan stays
+    reachable on the network)."""
+    try:
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=15)
+        else:
+            import os
+            import signal
+            os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:
+        pass
+    try:
+        proc.kill()
+        proc.wait(timeout=5)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

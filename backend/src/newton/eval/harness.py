@@ -37,6 +37,18 @@ def _write_files(root: Path, files: dict[str, str]) -> None:
         p.write_text(content, encoding="utf-8")
 
 
+# Grader files: the hidden check that scores a run. They are NOT task inputs — the agent under test must
+# never see them, or it can import or copy the grader (measured 2026-10-12: a generated test did
+# `from check import ...` and another copied the grader's assertion text). Task-provided tests
+# (test_*.py) stay visible: they are part of the task's specification.
+_GRADERS = {"check.py"}
+
+
+def task_inputs(task: EvalTask) -> dict[str, str]:
+    """The files the agent is given: everything except the hidden grader."""
+    return {rel: c for rel, c in task.files.items() if rel.rsplit("/", 1)[-1] not in _GRADERS}
+
+
 def _is_checker(rel: str) -> bool:
     base = rel.rsplit("/", 1)[-1]
     return base.startswith("test_") or base == "check.py"
@@ -72,8 +84,8 @@ def _run_check(root: Path, check: str) -> bool:
 def run_baseline(task: EvalTask, model: str, root: Path) -> bool:
     """The control arm: one naive prompt for ALL changed files, write them, check. No staging,
     retrieval, or verify — a fair one-shot attempt at the whole task."""
-    _write_files(root, task.files)
-    shown = "\n\n".join(f"### {rel}\n```\n{content}\n```" for rel, content in task.files.items()) \
+    _write_files(root, task_inputs(task))
+    shown = "\n\n".join(f"### {rel}\n```\n{content}\n```" for rel, content in task_inputs(task).items()) \
         or "(no files yet)"
     messages = [
         {"role": "system", "content": BASELINE_SYSTEM},
@@ -106,7 +118,7 @@ def run_baseline(task: EvalTask, model: str, root: Path) -> bool:
 
 def run_newton(task: EvalTask, model: str, root: Path) -> bool:
     """Treatment arm A: the staged Conductor (Understand→…→Verify→Review→Remember)."""
-    _write_files(root, task.files)
+    _write_files(root, task_inputs(task))
     settings = load_settings(str(root))
     settings.agent_model = model
     try:
@@ -122,7 +134,7 @@ def run_loop(task: EvalTask, model: str, root: Path) -> bool:
     """Treatment arm B: the decomposition-loop engine (the differentiator) — decompose into atomic
     steps, shape per-step context, verify, checkpoint."""
     from ..loop import LoopEngine
-    _write_files(root, task.files)
+    _write_files(root, task_inputs(task))
     settings = load_settings(str(root))
     settings.agent_model = model
     try:

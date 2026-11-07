@@ -137,6 +137,39 @@ print("integration ok: probed %d GET route(s), no server errors" % len(paths))
 '''
 
 
+def _is_test_module(name: str) -> bool:
+    """A test module by file path (`pkg/test_x.py`) or dotted import name (`pkg.test_x`)."""
+    base = name.replace("\\", "/").rsplit("/", 1)[-1].removesuffix(".py").rsplit(".", 1)[-1]
+    return base.startswith("test_") or base.endswith("_test") or base in {"conftest", "tests"}
+
+
+def _unused_test_imports(tree) -> set[int]:
+    """1-based line numbers of top-level imports of test modules whose imported names are never used
+    elsewhere in the module. Conservative: an import whose name IS used is kept."""
+    import ast
+    used: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            used.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            base = node
+            while isinstance(base, ast.Attribute):
+                base = base.value
+            if isinstance(base, ast.Name):
+                used.add(base.id)
+    drop: set[int] = set()
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module and _is_test_module(node.module):
+            names = [a.asname or a.name for a in node.names]
+        elif isinstance(node, ast.Import) and all(_is_test_module(a.name) for a in node.names):
+            names = [(a.asname or a.name).split(".")[0] for a in node.names]
+        else:
+            continue
+        if not any(n in used for n in names):
+            drop.update(range(node.lineno, (node.end_lineno or node.lineno) + 1))
+    return drop
+
+
 @dataclass
 class LoopResult:
     ok: bool
@@ -1000,10 +1033,23 @@ class LoopEngine:
             tree = ast.parse(src)
         except (OSError, SyntaxError):
             return False
-        symbols = self._project_symbols()
-        self_mod = _module_of(rel)
         lines = src.splitlines()
         changed = False
+        if os.getenv("NEWTON_LOOP_NO_TEST_IMPORTS", "0") == "1" and not _is_test_module(rel):
+            # Production code never needs a test module. Measured 2026-10-19: gemma3:4b wrote
+            # `from test_calc import test_add, test_mul` atop calc.py — a circular import that failed
+            # verify at line 1 although add/mul were correct (15 of gemma's eval failures stop at line 1).
+            # Drop such an import only when none of its names are used elsewhere in the file.
+            drop = _unused_test_imports(tree)
+            if drop:
+                lines = [ln for i, ln in enumerate(lines, 1) if i not in drop]
+                changed = True
+                try:
+                    tree = ast.parse("\n".join(lines))
+                except SyntaxError:
+                    return False
+        symbols = self._project_symbols()
+        self_mod = _module_of(rel)
         for node in tree.body:
             if not isinstance(node, ast.ImportFrom) or node.module is None or node.level != 0:
                 continue

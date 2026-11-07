@@ -27,6 +27,7 @@ from ..config import Settings
 from ..context import project_tree
 from ..index.graph import _module_of
 from ..tools import ToolBelt
+from .acceptance import FILE as ACCEPT_FILE
 from .decide import error_signature
 from .decision import CHOICE, NOUL, SCORE, Decision
 from .decompose import decompose
@@ -339,6 +340,8 @@ class LoopEngine:
         # win comes from parallel slots (num_parallel>1 batches on the GPU) and from a step's pytest/
         # subprocess overlapping another's generation. Opt in via NEWTON_LOOP_PARALLEL; measure per box.
         self.parallel = max(1, int(os.environ.get("NEWTON_LOOP_PARALLEL", "1")))
+        self._accept = None                           # qualified red acceptance test (loop/acceptance.py)
+        self._accept_tried = False                    # the writer ran this run (qualified or not)
         self._state_lock = threading.Lock()           # guards checkpoint saves + status writes in a wave
 
     def _make_summarizer(self) -> Callable[[str, int], str]:
@@ -363,6 +366,7 @@ class LoopEngine:
         self._decisions = []                           # fresh audit trail of bounded forks per run
         self._run_id = uuid.uuid4().hex[:8]            # tag advisory rows to this run
         self._collector = None
+        self._accept, self._accept_tried = None, False
         if self._judge is not None or os.getenv("NEWTON_LOOP_ADVISORY_JUDGE", "0") == "1":
             from .advisory_collector import AdvisoryCollector
             self._collector = AdvisoryCollector(
@@ -383,6 +387,7 @@ class LoopEngine:
         # steps) the UI derives from the plan + step events; this makes the ceiling explicit.
         self.emit("budget", {"effort": self.effort.name, "attempts": self.effort.max_attempts,
                              "repairs": self.effort.repair_cycles, "replans": self.effort.replan_cycles})
+        self._prepare_acceptance(state, goal, resume)
         self._drive(state)
         # Self-generated verification: if the plan built code but planned no check, write a
         # goal-grounded test and run it — so a step's LOGIC is validated even when the model forgot
@@ -413,6 +418,7 @@ class LoopEngine:
         # app won't even load. As a final gate, import the entrypoint with its real deps and let a
         # load failure feed the repair loop — closing the wiring gap the Scene Script Studio E2E
         # (D63) exposed, where 14/14 steps were "done" but the app didn't run.
+        self._ensure_acceptance_check(state)
         self._ensure_integration_check(state)
 
         return self._finalize(state)
@@ -443,6 +449,16 @@ class LoopEngine:
         """Drive ONE step to DONE/FAILED: best-of-N attempts, import repair, verify, checkpoint.
         Thread-safe — the only shared mutations (log append, checkpoint save, the completion emit)
         are taken under a lock, and each step owns a distinct file, so a wave can run this in parallel."""
+        if self._accept is not None and step.kind != RUN \
+                and step.file.replace("\\", "/").removeprefix("./") == ACCEPT_FILE:
+            step.status, step.result = DONE, "kept the frozen acceptance test (it is never rewritten)"
+            self.emit("note", f"Step {step.id} would rewrite {ACCEPT_FILE} — skipped, the test is frozen.")
+            with self._state_lock:
+                state.log.append(f"{step.id} skipped: frozen acceptance test")
+                state.save(self.checkpoint_path)
+            return
+        if step.id == "a_run":
+            self._restore_acceptance(state)
         step.status = RUNNING
         self.emit("step", {"id": step.id, "goal": step.goal, "kind": step.kind,
                            "file": step.file, "status": "start"})
@@ -500,6 +516,8 @@ class LoopEngine:
             culprit_conf, culprit_why = 0.95, "the test file defines no def test_* functions"
         else:
             culprit = self._culprit_step(failed.result, state)
+            if culprit is None and failed.id == "a_run":
+                culprit = self._acceptance_culprit(state)
             if culprit is None:
                 return False
             self.emit("note", f"A check failed — fixing {culprit.file or culprit.id} and re-running it.")
@@ -590,6 +608,18 @@ class LoopEngine:
                 if mod in mod_to_step:
                     return mod_to_step[mod]
         return fallback
+
+    def _acceptance_culprit(self, state: LoopState) -> Step | None:
+        """The frozen acceptance test drives a CLI as a subprocess (`[sys.executable, 'greet.py', ...]`),
+        so it imports no project module and names no production file in its traceback. Route the fix to
+        the production WRITE step whose file the test mentions — never to a test file (the test is frozen)."""
+        text = self._accept.content if self._accept is not None else ""
+        for s in state.steps:
+            base = s.file.replace("\\", "/").rsplit("/", 1)[-1]
+            if s.kind != RUN and base.endswith(".py") and not base.startswith("test_") \
+                    and (f"'{base}'" in text or f'"{base}"' in text or f"/{base}" in text):
+                return s
+        return None
 
     def _imports_of_test(self, test_rel: str) -> list[str]:
         """Project modules a test file imports (`from service import Ledger` → 'service'), so a
@@ -684,6 +714,69 @@ class LoopEngine:
                 f"names they rely on working (do not rename or remove them; change only the "
                 f"implementation):\n" + "\n".join(lines))
 
+    def _prepare_acceptance(self, state: LoopState, goal: str, resume: bool) -> None:
+        """Red acceptance test (opt-in, NEWTON_LOOP_RED_ACCEPT=1): BEFORE any implementation step, while
+        the folder is still the pre-change code, a separate model call that sees only the goal + file
+        names writes test_acceptance.py; it must fail here (red) to qualify, then it is frozen. Its
+        pass at the end is what lets the verdict say PASS. See loop/acceptance.py."""
+        if os.getenv("NEWTON_LOOP_RED_ACCEPT", "0") != "1" or resume:
+            return
+        from ..llm import complete
+        from .acceptance import prepare
+        model = os.getenv("NEWTON_ACCEPT_MODEL", "ollama:qwen2.5-coder:7b")
+        self.emit("note", "Writing an independent acceptance test and checking it fails before the change…")
+        self._accept_tried = True
+        acc = prepare(self.root, goal, project_tree(self.root), model, complete)
+        state.log.append(f"acceptance: qualified={acc.qualified} attempts={acc.attempts} — {acc.reason}")
+        self._decisions.append(Decision(
+            name="acceptance_test", kind=SCORE,
+            question="Did an independent test qualify (fails on the pre-change code)?",
+            answer="yes" if acc.qualified else "no", confidence=1.0,
+            reason=f"{acc.reason} (after {acc.attempts} attempt(s), model {model})"))
+        if acc.qualified:
+            self._accept = acc
+            self.emit("note", f"Acceptance test qualified (fails before the change) — frozen as {ACCEPT_FILE}.")
+        else:
+            self.emit("note", f"No acceptance test qualified ({acc.reason}) — the verdict can't be PASS.")
+        state.save(self.checkpoint_path)
+
+    def _restore_acceptance(self, state: LoopState) -> None:
+        """Freeze: if anything changed the acceptance test, put the qualified version back and log it."""
+        if self._accept is None:
+            return
+        path = self.root / ACCEPT_FILE
+        try:
+            current = path.read_text(encoding="utf-8")
+        except OSError:
+            current = None
+        if current != self._accept.content:
+            path.write_text(self._accept.content, encoding="utf-8")
+            state.log.append("acceptance: test was changed during the run — restored the frozen version")
+            self.emit("note", f"{ACCEPT_FILE} was changed during the run — restored the frozen version.")
+
+    def _ensure_acceptance_check(self, state: LoopState) -> None:
+        """Green gate: run the frozen acceptance test on the finished code; a failure feeds the normal
+        repair (which can only fix code — the test has no write step and is restored before each run)."""
+        if self._accept is None:
+            return
+        from .acceptance import COMMAND
+        step = state.by_id("a_run")
+        if step is not None and step.status == DONE:
+            return
+        if step is None:
+            step = Step(id="a_run", kind=RUN, command=COMMAND,
+                        goal=f"run the frozen acceptance test {ACCEPT_FILE}")
+            state.steps.append(step)
+            self.emit("plan", [{"id": step.id, "goal": step.goal, "kind": step.kind,
+                                "file": step.file, "depends_on": step.depends_on}])
+        step.status = PENDING
+        state.save(self.checkpoint_path)
+        self._run_step(step, state)
+        for _ in range(self.effort.repair_cycles):
+            if not self._repair_from_test_failure(state):
+                break
+            self._drive(state)
+
     def _ensure_verification(self, state: LoopState, goal: str) -> None:
         """If the plan produced code but NO check, generate a goal-grounded test and run it — so a
         step's LOGIC is validated even when the model didn't plan a test. Conservative on purpose: a
@@ -694,6 +787,8 @@ class LoopEngine:
             return
         if any(s.kind == RUN for s in state.steps):
             return                                   # the model already planned a check — trust it
+        if self._accept is not None:
+            return                                   # the frozen acceptance test is the check
         code = [s for s in state.steps if s.kind != RUN and s.file.endswith(".py")
                 and not s.file.rsplit("/", 1)[-1].startswith("test_") and s.status == DONE]
         if not code:
@@ -900,7 +995,27 @@ class LoopEngine:
                             if not d.rsplit("/", 1)[-1].startswith("test_")]
                     if deps:
                         fwd.append((s.file, deps))
-        return review_run(failed, fwd)
+        vd = review_run(failed, fwd)
+        return self._acceptance_verdict(state, vd)
+
+    def _acceptance_verdict(self, state: LoopState, vd):
+        """With the red acceptance test on: PASS needs the frozen test to have passed; no qualified test
+        caps the verdict at NEEDS ATTENTION (no independent check); a failing one is WOULD BLOCK."""
+        from .verdict import ATTENTION, BLOCK, PASS, Verdict
+        if not self._accept_tried:
+            return vd
+        if self._accept is None:
+            if vd.level == PASS:
+                return Verdict(ATTENTION, "verified only by Newton's own checks — no independent "
+                                          "acceptance test qualified")
+            return vd
+        a = state.by_id("a_run")
+        if a is None or a.status != DONE:
+            first = next((ln.strip() for ln in (a.result if a else "").splitlines()
+                          if ln.strip().startswith(("E ", "FAILED", "assert"))), "")
+            tail = f": {first[:160]}" if first else ""
+            return Verdict(BLOCK, f"the frozen acceptance test did not pass{tail}")
+        return vd
 
     def _finalize(self, state: LoopState) -> LoopResult:
         for s in state.steps:                          # anything left had a failed/blocked dependency

@@ -24,6 +24,17 @@ _client = ai.Client({"ollama": {"timeout": _TIMEOUT}})
 # capability ceiling behind "we can't hold 60k tokens like the llama.cpp setup". Lift it explicitly.
 # Bigger num_ctx costs RAM (KV cache) and first-token latency; local has time to spare. Configurable.
 _NUM_CTX = int(os.environ.get("NEWTON_NUM_CTX", "16384"))
+# How many layers Ollama puts on the GPU. Unset = Ollama decides. Its estimate is cautious on small
+# cards: measured 2026-11-08 on a 4 GB GTX 1650 Ti at num_ctx 16384, gemma3:4b got 43% of the model on
+# the GPU at 8–12 tok/s by default vs 100% at 47.5 tok/s with 99 (= all layers). Opt-in per machine.
+_NUM_GPU = os.environ.get("NEWTON_NUM_GPU", "").strip()
+
+
+def _ollama_options(temperature: float) -> dict[str, Any]:
+    opts: dict[str, Any] = {"num_ctx": _NUM_CTX, "temperature": temperature}
+    if _NUM_GPU.lstrip("-").isdigit():
+        opts["num_gpu"] = int(_NUM_GPU)
+    return opts
 
 
 def complete(
@@ -46,7 +57,7 @@ def complete(
     # For Ollama, sampling and context size live in `options` (top-level temperature is ignored),
     # so set num_ctx AND temperature there — otherwise we run truncated and at the default temp.
     if str(model).startswith("ollama") and _NUM_CTX > 0:
-        kwargs["options"] = {"num_ctx": _NUM_CTX, "temperature": temperature}
+        kwargs["options"] = _ollama_options(temperature)
     if tools:
         kwargs["tools"] = tools
     resp = _client.chat.completions.create(**kwargs)
